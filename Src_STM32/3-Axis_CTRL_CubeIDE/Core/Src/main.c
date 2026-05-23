@@ -1,0 +1,720 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+
+#include "st7735_optimized.h"
+#include "UART_parser.h"
+#include "stepper_v3.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_tx;
+
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+Command_t my_cmd = {0};
+
+// Vars for stop/continue button
+volatile uint8_t is_paused = 0;
+volatile uint8_t last_button_state = 1;
+
+
+//DISPLAY TFT VARIABLES
+// Các biến lưu tọa độ thực tế của máy CNC (đơn vị mm)
+float cnc_pos_x = 0.000;
+float cnc_pos_y = 0.000;
+float cnc_pos_z = 0.000;
+
+// Các bộ đệm chứa chuỗi ký tự hiển thị ra màn hình
+char disp_buf_x[20];
+char disp_buf_y[20];
+char disp_buf_z[20];
+
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_SPI1_Init(void);
+/* USER CODE BEGIN PFP */
+void Machine_Wait_Until_Done(void);
+void Update_CNC_Display(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  MX_USART1_UART_Init();
+  MX_SPI1_Init();
+  /* USER CODE BEGIN 2 */
+  char wlc[] = "System ready\n";
+  HAL_UART_Transmit(&huart1, (uint8_t*)wlc, strlen(wlc), 100);
+
+  UART_Queue_Init(&huart1);
+
+  /* --- KHỞI TẠO MÀN HÌNH TFT LCD --- */
+    ST7735_Init();
+    ST7735_SetOrientation(1); // Xoay ngang màn hình (160x128)
+    ST7735_FillScreen(ST7735_BLACK); // Nền đen lịch lãm
+
+    // Vẽ tiêu đề cố định
+    ST7735_DrawString_DMA(15, 5, "--- CNC MONITOR ---", Font_11x18, ST7735_YELLOW, ST7735_BLACK);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+	  	  //Update_CNC_Display();
+		  //===============================================================
+		  // Luôn luôn lắng nghe UART để nạp lệnh vào hàng đợi
+		  //===============================================================
+		  if (UART_Parse_Command(&my_cmd) == true && is_paused == 0)
+		  {
+			// Khi nhận được lệnh G-code, biến is_ready của cmd sẽ bật lên
+			// Trong code của bạn, việc xử lý G1/G0 đã có vòng lặp chặn:
+			// while (z_step_count > 0 || step_count > 0);
+				  //===============================================================
+				//GCODE PROCESSING
+				//===============================================================
+				char rcv_msg[] = "CMD received\n";
+				HAL_UART_Transmit(&huart1, (uint8_t*)rcv_msg, strlen(rcv_msg), 100);
+
+				for (int i = 0; my_cmd.str[i] != '\0'; i++) {
+						my_cmd.str[i] = toupper((unsigned char)my_cmd.str[i]);
+				}
+
+
+				if (strncmp(my_cmd.str, "RMLOCK", 7) == 0)
+				{
+						system_alarm = 0; // MỞ KHÓA MÁY!
+						HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 45, 100);
+				}
+				// ==========================================
+				// G0: HOMING
+				// ==========================================
+				else if (strncmp(my_cmd.str, "G0", 2) == 0)
+				{
+						Stepper_Homing();       // Homing XY
+						Stepper_Z_Homing_PWM(); // Homing Z
+
+						char ack[] = "ok: Homing done\n";
+						HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+
+					my_cmd.is_ready = false;
+				}
+				// ==========================================
+				// G1:
+				// ==========================================
+				else if (strncmp(my_cmd.str, "G1", 2) == 0)
+				{
+						float target_x = current_target_x_mm;
+						float target_y = current_target_y_mm;
+						float target_z = current_target_z_deg;
+						uint8_t move_xy = 0, move_z = 0;
+
+						// T�ch chu?i t�m X, Y, Z
+						char *ptr = my_cmd.str + 2;
+						while (*ptr != '\0') {
+								if (*ptr == 'X') { target_x = atof(ptr + 1); move_xy = 1; }
+								else if (*ptr == 'Y') { target_y = atof(ptr + 1); move_xy = 1; }
+								else if (*ptr == 'Z') { target_z = atof(ptr + 1); move_z = 1; }
+								ptr++;
+						}
+
+						current_target_x_mm = target_x;
+						current_target_y_mm = target_y;
+						current_target_z_deg = target_z;
+
+						if (move_z) { Stepper_Z_GoTo_Degree(target_z); }
+						if (move_xy) { Stepper_GoTo_mm(target_x, target_y); }
+
+
+								Machine_Wait_Until_Done();
+
+								char ack[] = "ok: Move done\n";
+								HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+								my_cmd.is_ready = false;
+						}
+
+						//G2, G3 processing
+						else if (strncmp(my_cmd.str, "G2", 2) == 0 || strncmp(my_cmd.str, "G3", 2) == 0)
+						{
+								uint8_t is_cw = (my_cmd.str[1] == '2');
+								float target_x = current_target_x_mm;
+								float target_y = current_target_y_mm;
+								float offset_i = 0, offset_j = 0;
+								uint8_t has_arc_data = 0;
+
+								char *ptr = my_cmd.str + 2;
+								while (*ptr != '\0') {
+										if (*ptr == 'X') { target_x = atof(ptr + 1); }
+										else if (*ptr == 'Y') { target_y = atof(ptr + 1); }
+										else if (*ptr == 'I') { offset_i = atof(ptr + 1); has_arc_data = 1; }
+										else if (*ptr == 'J') { offset_j = atof(ptr + 1); has_arc_data = 1; }
+										ptr++;
+								}
+
+								if (has_arc_data) {
+										// Gọi thẳng hàm tính toán từ thư viện stepper_v3
+										Stepper_Arc_mm(target_x, target_y, offset_i, offset_j, is_cw);
+								}
+
+								char ack[] = "ok: Arc Move done\n";
+								HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+								my_cmd.is_ready = false;
+						}
+				// ==========================================
+				// INVALID CHECK
+				// ==========================================
+				else
+				{
+						char err[] = "error: Unknown command\n";
+						HAL_UART_Transmit(&huart1, (uint8_t*)err, strlen(err), 100);
+						my_cmd.is_ready = false;
+				}
+		}
+
+				//===============================================================
+				//MANUAL CTRL PROCESSING
+				//===============================================================
+				if (step_count == 0 && z_step_count == 0 && my_cmd.is_ready == false && is_paused == 0)
+				{
+						int16_t move_x = 0;
+						int16_t move_y = 0;
+						float move_z = 0;
+
+						// 1. Quét trạng thái nút bấm X, Y
+						if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_RESET) move_x = 40;
+						else if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET) move_x = -40;
+
+						if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_2) == GPIO_PIN_RESET) move_y = 40;
+						else if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_3) == GPIO_PIN_RESET) move_y = -40;
+
+						// 2. Quét trạng thái nút bấm Z (PA2, PA3)
+						if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == GPIO_PIN_RESET) move_z = 1.0f;
+						else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3) == GPIO_PIN_RESET) move_z = -1.0f;
+
+						// 3. Ra lệnh chạy trục XY
+						if (move_x != 0 || move_y != 0)
+						{
+								Stepper_Run_2D(move_x, move_y);
+								current_target_x_mm = (float)current_pos_x / STEPS_PER_MM_X;
+								current_target_y_mm = (float)current_pos_y / STEPS_PER_MM_Y;
+						}
+
+						// 4. Ra lệnh chạy trục Z
+						if (move_z != 0)
+						{
+								// Tính toán đích đến mới (cộng thêm hoặc trừ đi 1 độ)
+								float new_target_z = current_target_z_deg + move_z;
+
+								// Dùng luôn hàm GoTo có sẵn của bạn
+								Stepper_Z_GoTo_Degree(new_target_z);
+
+								// Cập nhật lại target để G-Code sau đó chạy không bị giật lùi
+								current_target_z_deg = new_target_z;
+						}
+				}
+		  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 83;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 83;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 999;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(Z_DIR_GPIO_Port, Z_DIR_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOE, X_PUL_Pin|X_DIR_Pin|Y_PUL_Pin|Y_DIR_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, ST7735_CS_Pin|ST7735_RES_Pin|ST7735_DC_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : Z_HOME_Pin */
+  GPIO_InitStruct.Pin = Z_HOME_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(Z_HOME_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : X__MANUAL_Pin X__MANUALC1_Pin Y__MANUAL_Pin Y__MANUALC3_Pin */
+  GPIO_InitStruct.Pin = X__MANUAL_Pin|X__MANUALC1_Pin|Y__MANUAL_Pin|Y__MANUALC3_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : Z__MANUAL_Pin Z__MANUALA3_Pin CONT_STOP_Pin */
+  GPIO_InitStruct.Pin = Z__MANUAL_Pin|Z__MANUALA3_Pin|CONT_STOP_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : Z_DIR_Pin */
+  GPIO_InitStruct.Pin = Z_DIR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(Z_DIR_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : X_PUL_Pin X_DIR_Pin Y_PUL_Pin Y_DIR_Pin */
+  GPIO_InitStruct.Pin = X_PUL_Pin|X_DIR_Pin|Y_PUL_Pin|Y_DIR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : ST7735_CS_Pin ST7735_RES_Pin ST7735_DC_Pin */
+  GPIO_InitStruct.Pin = ST7735_CS_Pin|ST7735_RES_Pin|ST7735_DC_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : X_HOME_Pin Y_HOME_Pin X_LIMIT_Pin Y_LIMIT_Pin */
+  GPIO_InitStruct.Pin = X_HOME_Pin|Y_HOME_Pin|X_LIMIT_Pin|Y_LIMIT_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PD0 PD1 PD2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;/**
+   * @brief  Hàm trợ lý cập nhật tọa độ 3 trục lên màn hình TFT bằng DMA (Định thời non-blocking)
+   */
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+/**
+  * @brief  Hàm trợ lý cập nhật tọa độ 3 trục lên màn hình TFT bằng DMA (Định thời non-blocking)
+  * 		Đồng thời cập nhật trạng thái is-paused = 0/1;
+  */
+void Machine_Wait_Until_Done(void)
+{
+    while (z_step_count > 0 || step_count > 0)
+    {
+        uint8_t current_button_state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4);
+
+		if (system_alarm == 1)
+        {
+            break;
+        }
+        if (current_button_state == GPIO_PIN_RESET && last_button_state == GPIO_PIN_SET)
+        {
+            HAL_Delay(50);
+            if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) == GPIO_PIN_RESET)
+            {
+                if (is_paused == 0) {
+                    HAL_TIM_Base_Stop_IT(&htim2);
+                    HAL_TIM_PWM_Stop_IT(&htim3, TIM_CHANNEL_1);
+                    is_paused = 1;
+                    HAL_UART_Transmit(&huart1, (uint8_t*)"EVENT: Machine Paused\n", 22, 100);
+                } else {
+                    is_paused = 0;
+                    if (step_count > 0) HAL_TIM_Base_Start_IT(&htim2);
+                    if (z_step_count > 0) HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1);
+                    HAL_UART_Transmit(&huart1, (uint8_t*)"EVENT: Machine Resumed\n", 23, 100);
+                }
+            }
+        }
+        last_button_state = current_button_state;
+
+        while (is_paused == 1)
+        {
+            if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) == GPIO_PIN_RESET)
+            {
+                HAL_Delay(50);
+                if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) == GPIO_PIN_RESET)
+                {
+                    is_paused = 0;
+                    if (step_count > 0) HAL_TIM_Base_Start_IT(&htim2);
+                    if (z_step_count > 0) HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1);
+                    HAL_UART_Transmit(&huart1, (uint8_t*)"EVENT: Machine Resumed\n", 23, 100);
+                    HAL_Delay(200);
+                }
+            }
+        }
+    }
+}
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */

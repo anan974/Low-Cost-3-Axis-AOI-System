@@ -1,0 +1,120 @@
+#ifndef __ST7735_FAST_H
+#define __ST7735_FAST_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fonts.h"
+
+/* uncomment which core you're using with */
+//#include "stm32f1xx_hal.h"
+#include "stm32f4xx_hal.h"
+
+//#define CORE    F1 
+#define CORE    F4 
+
+#define ST7735_WIDTH    160
+#define ST7735_HEIGHT   128
+
+#define ST7735_MADCTL_MY  0x80
+#define ST7735_MADCTL_MX  0x40
+#define ST7735_MADCTL_MV  0x20
+#define ST7735_MADCTL_ML  0x10
+#define ST7735_MADCTL_RGB 0x00
+#define ST7735_MADCTL_BGR 0x08
+#define ST7735_MADCTL_MH  0x04
+
+/* GPIO pin define */
+#define ST7735_Select()     HAL_GPIO_WritePin(ST7735_CS_GPIO_Port, ST7735_CS_Pin, GPIO_PIN_RESET)
+#define ST7735_Unselect()   HAL_GPIO_WritePin(ST7735_CS_GPIO_Port, ST7735_CS_Pin, GPIO_PIN_SET)
+#define ST7735_CMD()        HAL_GPIO_WritePin(ST7735_DC_GPIO_Port, ST7735_DC_Pin, GPIO_PIN_RESET)
+#define ST7735_DATA()       HAL_GPIO_WritePin(ST7735_DC_GPIO_Port, ST7735_DC_Pin, GPIO_PIN_SET) 
+#define ST7735_RESET_ON()   HAL_GPIO_WritePin(ST7735_RES_GPIO_Port, ST7735_RES_Pin, GPIO_PIN_RESET)
+#define ST7735_RESET_OFF()  HAL_GPIO_WritePin(ST7735_RES_GPIO_Port, ST7735_RES_Pin, GPIO_PIN_SET)
+
+#define ST7735_DC_Pin        GPIO_PIN_1
+#define ST7735_DC_GPIO_Port  GPIOA
+#define ST7735_RES_Pin       GPIO_PIN_2
+#define ST7735_RES_GPIO_Port GPIOA
+#define ST7735_CS_Pin        GPIO_PIN_3
+#define ST7735_CS_GPIO_Port  GPIOA
+
+/* Commands */
+#define ST7735_NOP     0x00
+#define ST7735_SWRESET 0x01
+#define ST7735_RDDID   0x04
+#define ST7735_RDDST   0x09
+#define ST7735_SLPIN   0x10
+#define ST7735_SLPOUT  0x11
+#define ST7735_PTLON   0x12
+#define ST7735_NORON   0x13
+#define ST7735_INVOFF  0x20
+#define ST7735_INVON   0x21
+#define ST7735_DISPOFF 0x28
+#define ST7735_DISPON  0x29
+#define ST7735_CASET   0x2A
+#define ST7735_RASET   0x2B
+#define ST7735_RAMWR   0x2C
+#define ST7735_RAMRD   0x2E
+#define ST7735_PTLAR   0x30
+#define ST7735_COLMOD  0x3A
+#define ST7735_MADCTL  0x36
+#define ST7735_FRMCTR1 0xB1
+#define ST7735_FRMCTR2 0xB2
+#define ST7735_FRMCTR3 0xB3
+#define ST7735_INVCTR  0xB4
+#define ST7735_DISSET5 0xB6
+#define ST7735_PWCTR1  0xC0
+#define ST7735_PWCTR2  0xC1
+#define ST7735_PWCTR3  0xC2
+#define ST7735_PWCTR4  0xC3
+#define ST7735_PWCTR5  0xC4
+#define ST7735_VMCTR1  0xC5
+#define ST7735_RDID1   0xDA
+#define ST7735_RDID2   0xDB
+#define ST7735_RDID3   0xDC
+#define ST7735_RDID4   0xDD
+#define ST7735_PWCTR6  0xFC
+#define ST7735_GMCTRP1 0xE0
+#define ST7735_GMCTRN1 0xE1
+
+/* RGB FORMAT */
+#define ST7735_COLOR565(r, g, b) (((r & 0xF8) << 8) | ((g & 0xFC) << 3) | ((b & 0xF8) >> 3))
+
+/* Predefined colors */
+#define ST7735_BLACK        0x0000
+#define ST7735_BLUE         0x001F
+#define ST7735_RED          0xF800
+#define ST7735_GREEN        0x07E0
+#define ST7735_CYAN         0x07FF
+#define ST7735_MAGENTA      0xF81F
+#define ST7735_YELLOW       0xFFE0
+#define ST7735_WHITE        0xFFFF
+
+extern SPI_HandleTypeDef hspi1;
+
+/* Basic control */
+void ST7735_Init(void);
+void ST7735_DisplayOn(void);
+void ST7735_DisplayOff(void);
+void ST7735_Invert(bool enable);
+
+/* Frame DMA core */
+void ST7735_BeginFrame(void);
+void ST7735_PushLine(uint16_t *lineBuf);
+void ST7735_WaitFrameDone(void);
+void ST7735_EndFrame(void);
+
+/* Pixel and drawing */
+void ST7735_DrawPixel(uint16_t x, uint16_t y, uint16_t color);
+void ST7735_FillScreen(uint16_t color);
+void ST7735_DrawImage(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint16_t *data);
+void ST7735_DrawString(uint16_t x, uint16_t y, const char *str, FontDef font, uint16_t fg, uint16_t bg);
+void ST7735_DrawString_DMA(uint16_t x, uint16_t y, const char *str, FontDef font, uint16_t fg, uint16_t bg);
+/* Utility */
+uint16_t ST7735_GetWidth(void);
+uint16_t ST7735_GetHeight(void);
+void ST7735_SetOrientation(uint8_t orientation);
+
+#endif
