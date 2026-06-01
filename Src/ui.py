@@ -8,6 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import serial.tools.list_ports
 import copy
+import time 
 
 # =========================================
 # IMPORTS MODULES
@@ -31,7 +32,6 @@ class LithoApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Litho & Deep Learning Inspection System")
-        # Kích thước cửa sổ mặc định
         self.root.geometry("1400x900")
 
         # State variables
@@ -42,6 +42,7 @@ class LithoApp:
         self.current_mode = "Manual"
         self.auto_timer_id = None
         self.last_snapshot_key = None
+        self.axis_control_enabled = True   # Để disable/enable nút axis khi đang gửi lệnh
 
         self.photo_live = None
         self.photo_static = None
@@ -164,7 +165,7 @@ class LithoApp:
         self.btn_update_ratio.pack(side=tk.LEFT, padx=2)
 
         ttk.Label(ana_frame, text="Mode:").pack(anchor=tk.W, pady=(5,0))
-        self.combo_mode = ttk.Combobox(ana_frame, values=["Manual", "Auto 1m30s", "Auto 2m"], state="readonly")
+        self.combo_mode = ttk.Combobox(ana_frame, values=["Manual", "Auto 1m30s", "Auto 2m"], state="disabled")
         self.combo_mode.current(0)
         self.combo_mode.bind("<<ComboboxSelected>>", self.on_mode_changed)
         self.combo_mode.pack(fill=tk.X, pady=2)
@@ -287,7 +288,7 @@ class LithoApp:
         return tree
 
     # =========================================
-    # CORE LOGIC: HARDWARE (giữ nguyên)
+    # CORE LOGIC: HARDWARE
     # =========================================
     def refresh_ports(self):
         all_ports = [port.device for port in serial.tools.list_ports.comports()]
@@ -338,22 +339,26 @@ class LithoApp:
     def _uart_read_loop(self):
         while not self.stop_uart_thread and self.uart.is_connected():
             try:
-                if self.uart.ser and self.uart.ser.in_waiting:
-                    line = self.uart.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if line.startswith("MODE:"):
-                        mode_str = line.split(":", 1)[1].strip()
-                        self.root.after(0, lambda m=mode_str: self._sync_mode_from_uart(m))
-            except Exception:
-                pass
+                state, line = self.uart.receive_state(timeout=0.5)
+                if state is not None:
+                    if state == "manual":
+                        self.root.after(0, lambda: self._set_mode_from_uart(0))
+                    elif state == "auto1.5":
+                        self.root.after(0, lambda: self._set_mode_from_uart(1))
+                    elif state == "auto2":
+                        self.root.after(0, lambda: self._set_mode_from_uart(2))
+            except AttributeError:
+                # Xảy ra khi self.uart.ser bị đặt thành None (ngắt kết nối)
+                print("UART disconnected, stopping read loop.")
+                break
+            except Exception as e:
+                print(f"UART read error: {e}")
+                time.sleep(0.1)
 
-    def _sync_mode_from_uart(self, mode_str):
-        if "Manual" in mode_str:
-            self.combo_mode.current(0)
-        elif "1m30s" in mode_str:
-            self.combo_mode.current(1)
-        elif "2m" in mode_str:
-            self.combo_mode.current(2)
-        self.on_mode_changed(None, send_uart=False)
+    def _set_mode_from_uart(self, mode_index):
+        self.combo_mode.current(mode_index)
+        self.on_mode_changed(send_uart=False)
+        self.set_status(f"Mode set to {self.combo_mode.get()} by UART.")
 
     def toggle_camera(self):
         if self.btn_cam_conn.cget("text") == "Connect Camera":
@@ -383,12 +388,25 @@ class LithoApp:
     def _live_callback(self, frame):
         self.root.after(0, self._show_image_on_canvas, frame, self.canvas_live)
 
+    # ------------------ Các hàm điều khiển trục (sử dụng send_move_command) ------------------
+    def _enable_axis_controls(self, enable):
+        state = tk.NORMAL if enable else tk.DISABLED
+        for btn in [self.btn_up, self.btn_down, self.btn_left, self.btn_right,
+                    self.btn_z_up, self.btn_z_down, self.btn_home]:
+            btn.config(state=state)
+        self.axis_control_enabled = enable
+
     def move_axis(self, direction):
         if self.current_mode != "Manual":
+            messagebox.showwarning("Warning", "Axis control only available in Manual mode.")
             return
         if not self.uart.is_connected():
             messagebox.showerror("Error", "UART not connected!")
             return
+        if not self.axis_control_enabled:
+            messagebox.showinfo("Info", "Previous command still processing. Please wait.")
+            return
+
         try:
             step_x = float(self.entry_step_x.get())
             step_y = float(self.entry_step_y.get())
@@ -397,35 +415,47 @@ class LithoApp:
             step_x = step_y = 10.0
             step_z = 1.0
 
-        cmd = ""
-        if direction == 'X+':
-            cmd = f"G1 X{step_x}"
-        elif direction == 'X-':
-            cmd = f"G1 X-{step_x}"
-        elif direction == 'Y+':
-            cmd = f"G1 Y{step_y}"
-        elif direction == 'Y-':
-            cmd = f"G1 Y-{step_y}"
-        elif direction == 'Z+':
-            cmd = f"G1 Z{step_z}"
-        elif direction == 'Z-':
-            cmd = f"G1 Z-{step_z}"
-        elif direction == 'home':
-            self.uart.home()
-            return
-
-        if cmd:
-            self.set_status(f"Moving {direction}...")
-            threading.Thread(target=self._send_uart_cmd, args=(cmd,), daemon=True).start()
-
-    def _send_uart_cmd(self, cmd):
-        if self.uart.is_connected():
-            success, response = self.uart.send_gcode(cmd, wait_for_done=False)
-            msg = f"Moved: {response}" if success else f"UART error: {response}"
-            self.root.after(0, lambda: self.set_status(msg))
+        # Xác định lệnh
+        if direction == 'home':
+            is_home = True
+            axis = None
+            pos = None
         else:
-            self.root.after(0, lambda: self.set_status("UART not connected."))
+            is_home = False
+            if direction == 'X+':
+                axis, pos = 'X', step_x
+            elif direction == 'X-':
+                axis, pos = 'X', -step_x
+            elif direction == 'Y+':
+                axis, pos = 'Y', step_y
+            elif direction == 'Y-':
+                axis, pos = 'Y', -step_y
+            elif direction == 'Z+':
+                axis, pos = 'Z', step_z
+            elif direction == 'Z-':
+                axis, pos = 'Z', -step_z
+            else:
+                return
 
+        # Disable nút điều khiển
+        self._enable_axis_controls(False)
+        self.set_status(f"Sending {direction}...")
+
+        def send_task():
+            success, msg = self.uart.send_move_command(
+                axis=axis, position=pos, is_home=is_home,
+                wait_for_confirm=True, timeout=40
+            )
+            if success:
+                self.root.after(0, lambda: messagebox.showinfo("Success", f"Command {direction} successful.\n{msg}"))
+            else:
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Command {direction} failed.\n{msg}"))
+            self.root.after(0, lambda: self._enable_axis_controls(True))
+            self.root.after(0, lambda: self.set_status("Ready"))
+
+        threading.Thread(target=send_task, daemon=True).start()
+
+    # ------------------ Các hàm khác (giữ nguyên) ------------------
     def on_mode_changed(self, event=None, send_uart=True):
         self.current_mode = self.combo_mode.get()
         if send_uart and self.uart.is_connected():
@@ -437,14 +467,18 @@ class LithoApp:
                 self.root.after_cancel(self.auto_timer_id)
                 self.auto_timer_id = None
             self.set_status("Manual Mode selected.")
+        else:
+            self.set_status(f"{self.current_mode} Mode selected.")
 
     def _update_controls_by_mode(self):
         state = tk.NORMAL if self.current_mode == "Manual" else tk.DISABLED
         for btn in [self.btn_measure, self.btn_detect, self.btn_upload, self.btn_capture]:
             btn.config(state=state)
-        for btn in [self.btn_up, self.btn_down, self.btn_left, self.btn_right,
-                    self.btn_z_up, self.btn_z_down, self.btn_home]:
-            btn.config(state=state)
+        # Axis controls được điều khiển riêng bởi _enable_axis_controls, nhưng cũng cần disable theo mode
+        if self.current_mode != "Manual":
+            self._enable_axis_controls(False)
+        else:
+            self._enable_axis_controls(True)
 
     # =========================================
     # CORE LOGIC: IMAGE & PROCESSING (giữ nguyên)
