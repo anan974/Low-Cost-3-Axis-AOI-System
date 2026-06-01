@@ -1,0 +1,10 @@
+../Core/Src/stepper_v3.c:69:6:Stepper_Run_2D	16	static
+../Core/Src/stepper_v3.c:121:6:Stepper_Move_mm	24	static
+../Core/Src/stepper_v3.c:129:6:Stepper_GoTo_mm	32	static
+../Core/Src/stepper_v3.c:142:6:Stepper_Homing	16	static
+../Core/Src/stepper_v3.c:169:6:Stepper_Arc_mm	88	static
+../Core/Src/stepper_v3.c:245:6:Stepper_Z_Run_Steps_PWM	16	static
+../Core/Src/stepper_v3.c:280:6:Stepper_Z_GoTo_Degree	24	static
+../Core/Src/stepper_v3.c:290:6:Stepper_Z_Homing_PWM	16	static
+../Core/Src/stepper_v3.c:309:6:HAL_TIM_PeriodElapsedCallback	16	static
+../Core/Src/stepper_v3.c:406:6:HAL_TIM_PWM_PulseFinishedCallback	16	static

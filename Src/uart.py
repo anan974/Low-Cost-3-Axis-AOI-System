@@ -199,11 +199,38 @@ class UARTManager:
         Đọc UART và trả về (state, raw_line). Các state:
         "manual", "auto1.5", "auto2", "unlock", "homing", "free", "error"
         """
+        """
         patterns = {
             "manual": "manual",
             "auto1.5": "auto1.5",
             "auto2": "auto2",
             "unlock": "msg: machine unlocked. proceed with caution!",
+            "homing": "ok: homing done",
+            "free": ["ok: move done", "ok: arc move done"],
+            "error": "error: unknown command"
+        }
+        """ 
+
+        """
+        Modified version to verify handshake
+        """
+        """
+        Đọc UART và trả về (state, raw_line).
+        """
+        patterns = {
+            # --- TÍN HIỆU REQUEST TỪ NÚT BẤM ---
+            "req_homing": "req:homing",
+            "req_rmlock": "req:rmlock",
+            "req_auto15": "req:auto_1.5s",
+            "req_auto30": "req:auto_3s",
+            
+            # --- BẮT TAY TRONG CHU TRÌNH AUTO ---
+            "snap": "snap",
+            "ok": "ok",
+            "finish": "finish",
+
+            # --- TÍN HIỆU PHẢN HỒI THÔNG THƯỜNG ---
+            "unlock": "machine unlocked",
             "homing": "ok: homing done",
             "free": ["ok: move done", "ok: arc move done"],
             "error": "error: unknown command"

@@ -26,7 +26,6 @@
 #include <string.h>
 #include <ctype.h>
 
-#include "st7735_optimized.h"
 #include "UART_parser.h"
 #include "stepper_v3.h"
 /* USER CODE END Includes */
@@ -38,7 +37,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BTN_HOMING_PORT  GPIOD
+#define BTN_HOMING_PIN   GPIO_PIN_3  // Nút 1: PD3 -> Homing về gốc
 
+#define BTN_RMLOCK_PORT  GPIOD
+#define BTN_RMLOCK_PIN   GPIO_PIN_4  // Nút 2: PD4 -> Gửi lệnh RMLOCK lên RPi
+
+#define BTN_AUTO15_PORT  GPIOD
+#define BTN_AUTO15_PIN   GPIO_PIN_5  // Nút 3: PD5 -> Vào chế độ Auto 1.5s
+
+#define BTN_AUTO30_PORT  GPIOD
+#define BTN_AUTO30_PIN   GPIO_PIN_6  // Nút 4: PD6 -> Vào chế độ Auto 3s
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,9 +56,6 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-SPI_HandleTypeDef hspi1;
-DMA_HandleTypeDef hdma_spi1_tx;
-
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
@@ -62,32 +68,27 @@ Command_t my_cmd = {0};
 volatile uint8_t is_paused = 0;
 volatile uint8_t last_button_state = 1;
 
+typedef enum {
+    MODE_NORMAL = 0,    // Mặc định: Mở khóa Manual Jogging, nhận lệnh tự do
+    MODE_AUTO_1_5S,     // Khóa Jogging, bắt tay với RPi (Delay 1.5s)
+    MODE_AUTO_3S        // Khóa Jogging, bắt tay với RPi (Delay 3s)
+} SystemMode_t;
 
-//DISPLAY TFT VARIABLES
-// Các biến lưu tọa độ thực tế của máy CNC (đơn vị mm)
-float cnc_pos_x = 0.000;
-float cnc_pos_y = 0.000;
-float cnc_pos_z = 0.000;
-
-// Các bộ đệm chứa chuỗi ký tự hiển thị ra màn hình
-char disp_buf_x[20];
-char disp_buf_y[20];
-char disp_buf_z[20];
-
+volatile SystemMode_t current_mode = MODE_NORMAL;
+uint32_t auto_delay_ms = 0;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_USART1_UART_Init(void);
-static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 void Machine_Wait_Until_Done(void);
 void Update_CNC_Display(void);
+void Machine_Button_Scan(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -124,24 +125,16 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_USART1_UART_Init();
-  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   char wlc[] = "System ready\n";
   HAL_UART_Transmit(&huart1, (uint8_t*)wlc, strlen(wlc), 100);
 
   UART_Queue_Init(&huart1);
 
-  /* --- KHỞI TẠO MÀN HÌNH TFT LCD --- */
-    ST7735_Init();
-    ST7735_SetOrientation(1); // Xoay ngang màn hình (160x128)
-    ST7735_FillScreen(ST7735_BLACK); // Nền đen lịch lãm
 
-    // Vẽ tiêu đề cố định
-    ST7735_DrawString_DMA(15, 5, "--- CNC MONITOR ---", Font_11x18, ST7735_YELLOW, ST7735_BLACK);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -150,160 +143,199 @@ int main(void)
   {
     /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
-	  	  //Update_CNC_Display();
-		  //===============================================================
-		  // Luôn luôn lắng nghe UART để nạp lệnh vào hàng đợi
-		  //===============================================================
-		  if (UART_Parse_Command(&my_cmd) == true && is_paused == 0)
-		  {
-			// Khi nhận được lệnh G-code, biến is_ready của cmd sẽ bật lên
-			// Trong code của bạn, việc xử lý G1/G0 đã có vòng lặp chặn:
-			// while (z_step_count > 0 || step_count > 0);
-				  //===============================================================
-				//GCODE PROCESSING
-				//===============================================================
-				char rcv_msg[] = "CMD received\n";
-				HAL_UART_Transmit(&huart1, (uint8_t*)rcv_msg, strlen(rcv_msg), 100);
+	    /* USER CODE BEGIN 3 */
+	          // ==============================================================
+	          // 1. LIÊN TỤC QUÉT 4 NÚT BẤM ĐỂ GỬI YÊU CẦU LÊN RPi
+	          // ==============================================================
+	          Machine_Button_Scan();
 
-				for (int i = 0; my_cmd.str[i] != '\0'; i++) {
-						my_cmd.str[i] = toupper((unsigned char)my_cmd.str[i]);
-				}
+	          // ==============================================================
+	          // 2. XỬ LÝ LỆNH G-CODE TỪ RPi GỬI XUỐNG
+	          // ==============================================================
+	          if (UART_Parse_Command(&my_cmd) == true && is_paused == 0)
+	          {
+	              char rcv_msg[] = "CMD received\n";
+	              HAL_UART_Transmit(&huart1, (uint8_t*)rcv_msg, strlen(rcv_msg), 100);
 
+	              // Viết hoa toàn bộ chuỗi lệnh
+	              for (int i = 0; my_cmd.str[i] != '\0'; i++) {
+	                  my_cmd.str[i] = toupper((unsigned char)my_cmd.str[i]);
+	              }
 
-				if (strncmp(my_cmd.str, "RMLOCK", 7) == 0)
-				{
-						system_alarm = 0; // MỞ KHÓA MÁY!
-						HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 45, 100);
-				}
-				// ==========================================
-				// G0: HOMING
-				// ==========================================
-				else if (strncmp(my_cmd.str, "G0", 2) == 0)
-				{
-						Stepper_Homing();       // Homing XY
-						Stepper_Z_Homing_PWM(); // Homing Z
+	              // KIỂM TRA TỪ KHÓA "LAST" (Báo hiệu đây là lệnh cuối cùng của chu trình)
+	              uint8_t is_last_cmd = (strstr(my_cmd.str, "LAST") != NULL) ? 1 : 0;
 
-						char ack[] = "ok: Homing done\n";
-						HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+	              // ==========================================
+	              // LỆNH RMLOCK: MỞ KHÓA MÁY
+	              // ==========================================
+	              if (strncmp(my_cmd.str, "RMLOCK", 6) == 0)
+	              {
+	                  system_alarm = 0; // MỞ KHÓA MÁY!
+	                  if (is_last_cmd) {
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 40, 100);
+	                  } else {
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 40, 100);
+	                  }
+	                  my_cmd.is_ready = false;
+	              }
+	              // ==========================================
+	              // G0: HOMING
+	              // ==========================================
+	              else if (strncmp(my_cmd.str, "G0", 2) == 0)
+	              {
+	                  Stepper_Homing();       // Homing XY
+	                  Stepper_Z_Homing_PWM(); // Homing Z
 
-					my_cmd.is_ready = false;
-				}
-				// ==========================================
-				// G1:
-				// ==========================================
-				else if (strncmp(my_cmd.str, "G1", 2) == 0)
-				{
-						float target_x = current_target_x_mm;
-						float target_y = current_target_y_mm;
-						float target_z = current_target_z_deg;
-						uint8_t move_xy = 0, move_z = 0;
+	                  if (is_last_cmd) {
+	                      current_mode = MODE_NORMAL; // Khôi phục chế độ bình thường
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"OK: Homing done\n", 16, 100);
+	                  } else {
+	                      char ack[] = "OK: Homing done\n";
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+	                  }
+	                  my_cmd.is_ready = false;
+	              }
+	              // ==========================================
+	              // G1: DI CHUYỂN TRỤC VÀ BẮT TAY AUTO
+	              // ==========================================
+	              else if (strncmp(my_cmd.str, "G1", 2) == 0)
+	              {
+	                  float target_x = current_target_x_mm;
+	                  float target_y = current_target_y_mm;
+	                  float target_z = current_target_z_deg;
+	                  uint8_t move_xy = 0, move_z = 0;
 
-						// T�ch chu?i t�m X, Y, Z
-						char *ptr = my_cmd.str + 2;
-						while (*ptr != '\0') {
-								if (*ptr == 'X') { target_x = atof(ptr + 1); move_xy = 1; }
-								else if (*ptr == 'Y') { target_y = atof(ptr + 1); move_xy = 1; }
-								else if (*ptr == 'Z') { target_z = atof(ptr + 1); move_z = 1; }
-								ptr++;
-						}
+	                  // Tách chuỗi tìm X, Y, Z
+	                  char *ptr = my_cmd.str + 2;
+	                  while (*ptr != '\0') {
+	                      if (*ptr == 'X') { target_x = atof(ptr + 1); move_xy = 1; }
+	                      else if (*ptr == 'Y') { target_y = atof(ptr + 1); move_xy = 1; }
+	                      else if (*ptr == 'Z') { target_z = atof(ptr + 1); move_z = 1; }
+	                      ptr++;
+	                  }
 
-						current_target_x_mm = target_x;
-						current_target_y_mm = target_y;
-						current_target_z_deg = target_z;
+	                  current_target_x_mm = target_x;
+	                  current_target_y_mm = target_y;
+	                  current_target_z_deg = target_z;
 
-						if (move_z) { Stepper_Z_GoTo_Degree(target_z); }
-						if (move_xy) { Stepper_GoTo_mm(target_x, target_y); }
+	                  if (move_z) { Stepper_Z_GoTo_Degree(target_z); }
+	                  if (move_xy) { Stepper_GoTo_mm(target_x, target_y); }
 
+	                  // Chờ động cơ chạy xong hoàn toàn
+	                  Machine_Wait_Until_Done();
 
-								Machine_Wait_Until_Done();
+	                  // [BẮT TAY RPi]: Nếu đang ở Mode Auto thì phải phát lệnh SNAP chụp ảnh
+	                  if (current_mode == MODE_AUTO_1_5S || current_mode == MODE_AUTO_3S)
+	                  {
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"SNAP\n", 5, 100); // Yêu cầu RPi chụp
+	                      HAL_Delay(auto_delay_ms);                               // Đợi camera lưu ảnh
 
-								char ack[] = "ok: Move done\n";
-								HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
-								my_cmd.is_ready = false;
-						}
+	                      if (is_last_cmd) {
+	                          current_mode = MODE_NORMAL; // Chạy xong hết -> nhả máy về Normal
+	                          HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100); // Báo RPi hạ màn
+	                      } else {
+	                          HAL_UART_Transmit(&huart1, (uint8_t*)"OK\n", 3, 100); // Đòi góc tiếp theo
+	                      }
+	                  }
+	                  else
+	                  {
+	                      // Ở chế độ Normal thông thường (Manual)
+	                      if (is_last_cmd) {
+	                          HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
+	                      } else {
+	                          char ack[] = "OK: Move done\n";
+	                          HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+	                      }
+	                  }
+	                  my_cmd.is_ready = false;
+	              }
+	              // ==========================================
+	              // G2, G3: NỘI SUY CUNG TRÒN
+	              // ==========================================
+	              else if (strncmp(my_cmd.str, "G2", 2) == 0 || strncmp(my_cmd.str, "G3", 2) == 0)
+	              {
+	                  uint8_t is_cw = (my_cmd.str[1] == '2');
+	                  float target_x = current_target_x_mm;
+	                  float target_y = current_target_y_mm;
+	                  float offset_i = 0, offset_j = 0;
+	                  uint8_t has_arc_data = 0;
 
-						//G2, G3 processing
-						else if (strncmp(my_cmd.str, "G2", 2) == 0 || strncmp(my_cmd.str, "G3", 2) == 0)
-						{
-								uint8_t is_cw = (my_cmd.str[1] == '2');
-								float target_x = current_target_x_mm;
-								float target_y = current_target_y_mm;
-								float offset_i = 0, offset_j = 0;
-								uint8_t has_arc_data = 0;
+	                  char *ptr = my_cmd.str + 2;
+	                  while (*ptr != '\0') {
+	                      if (*ptr == 'X') { target_x = atof(ptr + 1); }
+	                      else if (*ptr == 'Y') { target_y = atof(ptr + 1); }
+	                      else if (*ptr == 'I') { offset_i = atof(ptr + 1); has_arc_data = 1; }
+	                      else if (*ptr == 'J') { offset_j = atof(ptr + 1); has_arc_data = 1; }
+	                      ptr++;
+	                  }
 
-								char *ptr = my_cmd.str + 2;
-								while (*ptr != '\0') {
-										if (*ptr == 'X') { target_x = atof(ptr + 1); }
-										else if (*ptr == 'Y') { target_y = atof(ptr + 1); }
-										else if (*ptr == 'I') { offset_i = atof(ptr + 1); has_arc_data = 1; }
-										else if (*ptr == 'J') { offset_j = atof(ptr + 1); has_arc_data = 1; }
-										ptr++;
-								}
+	                  if (has_arc_data) {
+	                      Stepper_Arc_mm(target_x, target_y, offset_i, offset_j, is_cw);
+	                  }
 
-								if (has_arc_data) {
-										// Gọi thẳng hàm tính toán từ thư viện stepper_v3
-										Stepper_Arc_mm(target_x, target_y, offset_i, offset_j, is_cw);
-								}
+	                  Machine_Wait_Until_Done();
 
-								char ack[] = "ok: Arc Move done\n";
-								HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
-								my_cmd.is_ready = false;
-						}
-				// ==========================================
-				// INVALID CHECK
-				// ==========================================
-				else
-				{
-						char err[] = "error: Unknown command\n";
-						HAL_UART_Transmit(&huart1, (uint8_t*)err, strlen(err), 100);
-						my_cmd.is_ready = false;
-				}
-		}
+	                  if (is_last_cmd) {
+	                      current_mode = MODE_NORMAL;
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
+	                  } else {
+	                      char ack[] = "ok: Arc Move done\n";
+	                      HAL_UART_Transmit(&huart1, (uint8_t*)ack, strlen(ack), 100);
+	                  }
+	                  my_cmd.is_ready = false;
+	              }
+	              // ==========================================
+	              // LỆNH LỖI / KHÔNG HỢP LỆ
+	              // ==========================================
+	              else
+	              {
+	                  char err[] = "error: Unknown command\n";
+	                  HAL_UART_Transmit(&huart1, (uint8_t*)err, strlen(err), 100);
+	                  my_cmd.is_ready = false;
+	              }
+	          }
 
-				//===============================================================
-				//MANUAL CTRL PROCESSING
-				//===============================================================
-				if (step_count == 0 && z_step_count == 0 && my_cmd.is_ready == false && is_paused == 0)
-				{
-						int16_t move_x = 0;
-						int16_t move_y = 0;
-						float move_z = 0;
+	          // ==============================================================
+	          // 3. XỬ LÝ BẺ TAY MANUAL JOGGING (CÓ KHÓA AN TOÀN)
+	          // ==============================================================
+	          // THÊM ĐIỀU KIỆN 'current_mode == MODE_NORMAL' ĐỂ KHÓA MANUAL KHI CHẠY AUTO
+	          if (current_mode == MODE_NORMAL && step_count == 0 && z_step_count == 0 && my_cmd.is_ready == false && is_paused == 0)
+	          {
+	              int16_t move_x = 0;
+	              int16_t move_y = 0;
+	              float move_z = 0;
 
-						// 1. Quét trạng thái nút bấm X, Y
-						if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_RESET) move_x = 40;
-						else if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET) move_x = -40;
+	              // 1. Quét trạng thái nút bấm X, Y
+	              if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_0) == GPIO_PIN_RESET) move_x = 40;
+	              else if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_1) == GPIO_PIN_RESET) move_x = -40;
 
-						if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_2) == GPIO_PIN_RESET) move_y = 40;
-						else if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_3) == GPIO_PIN_RESET) move_y = -40;
+	              if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_2) == GPIO_PIN_RESET) move_y = 40;
+	              else if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_3) == GPIO_PIN_RESET) move_y = -40;
 
-						// 2. Quét trạng thái nút bấm Z (PA2, PA3)
-						if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == GPIO_PIN_RESET) move_z = 1.0f;
-						else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3) == GPIO_PIN_RESET) move_z = -1.0f;
+	              // 2. Quét trạng thái nút bấm Z (PA2, PA3)
+	              if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_2) == GPIO_PIN_RESET) move_z = 1.0f;
+	              else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3) == GPIO_PIN_RESET) move_z = -1.0f;
 
-						// 3. Ra lệnh chạy trục XY
-						if (move_x != 0 || move_y != 0)
-						{
-								Stepper_Run_2D(move_x, move_y);
-								current_target_x_mm = (float)current_pos_x / STEPS_PER_MM_X;
-								current_target_y_mm = (float)current_pos_y / STEPS_PER_MM_Y;
-						}
+	              // 3. Ra lệnh chạy trục XY
+	              if (move_x != 0 || move_y != 0)
+	              {
+	                  Stepper_Run_2D(move_x, move_y);
+	                  current_target_x_mm = (float)current_pos_x / STEPS_PER_MM_X;
+	                  current_target_y_mm = (float)current_pos_y / STEPS_PER_MM_Y;
+	              }
 
-						// 4. Ra lệnh chạy trục Z
-						if (move_z != 0)
-						{
-								// Tính toán đích đến mới (cộng thêm hoặc trừ đi 1 độ)
-								float new_target_z = current_target_z_deg + move_z;
-
-								// Dùng luôn hàm GoTo có sẵn của bạn
-								Stepper_Z_GoTo_Degree(new_target_z);
-
-								// Cập nhật lại target để G-Code sau đó chạy không bị giật lùi
-								current_target_z_deg = new_target_z;
-						}
-				}
-		  }
-  /* USER CODE END 3 */
+	              // 4. Ra lệnh chạy trục Z
+	              if (move_z != 0)
+	              {
+	                  float new_target_z = current_target_z_deg + move_z;
+	                  Stepper_Z_GoTo_Degree(new_target_z);
+	                  current_target_z_deg = new_target_z;
+	              }
+	          }
+	    }
+	    /* USER CODE END 3 */
 }
 
 /**
@@ -349,44 +381,6 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
 }
 
 /**
@@ -527,22 +521,6 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA2_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA2_Stream3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -613,17 +591,17 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : X_HOME_Pin Y_HOME_Pin X_LIMIT_Pin Y_LIMIT_Pin */
-  GPIO_InitStruct.Pin = X_HOME_Pin|Y_HOME_Pin|X_LIMIT_Pin|Y_LIMIT_Pin;
+  /*Configure GPIO pins : X_HOME_Pin Y_HOME_Pin X_LIMIT_Pin Y_LIMIT_Pin
+                           PD3 PD4 PD5 PD6 */
+  GPIO_InitStruct.Pin = X_HOME_Pin|Y_HOME_Pin|X_LIMIT_Pin|Y_LIMIT_Pin
+                          |GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PD0 PD1 PD2 */
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;/**
-   * @brief  Hàm trợ lý cập nhật tọa độ 3 trục lên màn hình TFT bằng DMA (Định thời non-blocking)
-   */
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
@@ -682,6 +660,52 @@ void Machine_Wait_Until_Done(void)
                     HAL_Delay(200);
                 }
             }
+        }
+    }
+}
+
+/**
+ * brief
+ * Hàm này để xử lý state khi nhấn các nút PD3-7
+ */
+void Machine_Button_Scan(void) {
+    // ---- NÚT 1: YÊU CẦU HOMING (PD3) ----
+    if (HAL_GPIO_ReadPin(BTN_HOMING_PORT, BTN_HOMING_PIN) == GPIO_PIN_RESET) {
+        HAL_Delay(20); // Chống rung
+        if (HAL_GPIO_ReadPin(BTN_HOMING_PORT, BTN_HOMING_PIN) == GPIO_PIN_RESET) {
+            HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:HOMING\n", 11, 100);
+            while (HAL_GPIO_ReadPin(BTN_HOMING_PORT, BTN_HOMING_PIN) == GPIO_PIN_RESET);
+        }
+    }
+
+    // ---- NÚT 2: YÊU CẦU RMLOCK TRÊN UI (PD4) ----
+    if (HAL_GPIO_ReadPin(BTN_RMLOCK_PORT, BTN_RMLOCK_PIN) == GPIO_PIN_RESET) {
+        HAL_Delay(20);
+        if (HAL_GPIO_ReadPin(BTN_RMLOCK_PORT, BTN_RMLOCK_PIN) == GPIO_PIN_RESET) {
+            HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:RMLOCK\n", 11, 100);
+            while (HAL_GPIO_ReadPin(BTN_RMLOCK_PORT, BTN_RMLOCK_PIN) == GPIO_PIN_RESET);
+        }
+    }
+
+    // ---- NÚT 3: YÊU CẦU CHẠY CHU TRÌNH AUTO 1.5S (PD5) ----
+    if (HAL_GPIO_ReadPin(BTN_AUTO15_PORT, BTN_AUTO15_PIN) == GPIO_PIN_RESET) {
+        HAL_Delay(20);
+        if (HAL_GPIO_ReadPin(BTN_AUTO15_PORT, BTN_AUTO15_PIN) == GPIO_PIN_RESET) {
+            current_mode = MODE_AUTO_1_5S;
+            auto_delay_ms = 1500;
+            HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:AUTO_1.5S\n", 14, 100);
+            while (HAL_GPIO_ReadPin(BTN_AUTO15_PORT, BTN_AUTO15_PIN) == GPIO_PIN_RESET);
+        }
+    }
+
+    // ---- NÚT 4: YÊU CẦU CHẠY CHU TRÌNH AUTO 3S (PD6) ----
+    if (HAL_GPIO_ReadPin(BTN_AUTO30_PORT, BTN_AUTO30_PIN) == GPIO_PIN_RESET) {
+        HAL_Delay(20);
+        if (HAL_GPIO_ReadPin(BTN_AUTO30_PORT, BTN_AUTO30_PIN) == GPIO_PIN_RESET) {
+            current_mode = MODE_AUTO_3S;
+            auto_delay_ms = 3000;
+            HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:AUTO_3S\n", 12, 100);
+            while (HAL_GPIO_ReadPin(BTN_AUTO30_PORT, BTN_AUTO30_PIN) == GPIO_PIN_RESET);
         }
     }
 }

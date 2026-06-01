@@ -60,8 +60,8 @@ all: main-build
 main-build: 3-Axis_CTRL_CubeIDE.elf secondary-outputs
 
 # Tool invocations
-3-Axis_CTRL_CubeIDE.elf 3-Axis_CTRL_CubeIDE.map: $(OBJS) $(USER_OBJS) C:\Users\Admin\OneDrive\OneDrive\ -\ Persional\OneDrive\PRojetcs\STM32\F407VET6\3-Axis_CTRL_CubeIDE\STM32F407VETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "3-Axis_CTRL_CubeIDE.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\Admin\OneDrive\OneDrive - Persional\OneDrive\PRojetcs\STM32\F407VET6\3-Axis_CTRL_CubeIDE\STM32F407VETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="3-Axis_CTRL_CubeIDE.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
+3-Axis_CTRL_CubeIDE.elf 3-Axis_CTRL_CubeIDE.map: $(OBJS) $(USER_OBJS) C:\Users\Admin\OneDrive\OneDrive\ -\ Persional\OneDrive\PRojetcs\Low-Cost-3-Axis-AOI-System\Src_STM32\3-Axis_CTRL_CubeIDE\STM32F407VETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "3-Axis_CTRL_CubeIDE.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\Admin\OneDrive\OneDrive - Persional\OneDrive\PRojetcs\Low-Cost-3-Axis-AOI-System\Src_STM32\3-Axis_CTRL_CubeIDE\STM32F407VETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="3-Axis_CTRL_CubeIDE.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -u _scanf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

@@ -68,6 +68,168 @@ class LithoApp:
         self.setup_ui()
         self._update_controls_by_mode()
 
+    ##################################################################################    
+        # --- ADDED FOR AUTO CONTROL
+        # --- FLAG FOR HANDSHAKE AUTO (MASTER-SLAVE) ---
+        self.is_auto_running = False
+        self.snap_triggered = threading.Event()
+        self.ok_received = threading.Event()
+        threading.Thread(target=self.serial_background_listener, daemon=True).start()
+    ##################################################################################
+    def serial_background_listener(self):
+        """Luồng ngầm liên tục bắt các tín hiệu REQ gửi lên từ STM32"""
+        while True:
+            if getattr(self, 'uart', None) and self.uart.is_connected():
+                try:
+                    state, raw_line = self.uart.receive_state(timeout=0.1)
+                    if not state:
+                        continue
+                        
+                    print(f"📥 [STM32 GỬI]: {raw_line}")
+
+                    if state == "req_homing":
+                        print(" -> RPi điều phối Homing...")
+                        self.uart.send_gcode("G0 LAST")
+                    elif state == "req_rmlock":
+                        print(" -> RPi điều phối Khóa/Mở...")
+                        self.uart.send_gcode("RMLOCK LAST")
+                    elif state == "req_auto15":
+                        self.start_auto_sequence_calculated(delay=1.5)
+                    elif state == "req_auto30":
+                        self.start_auto_sequence_calculated(delay=3.0)
+
+                    # BẮT TAY ĐỒNG BỘ
+                    elif state == "snap":
+                        self.snap_triggered.set()
+                    elif state == "ok":
+                        self.ok_received.set()
+                    elif state == "finish":
+                        self.handle_mcu_finish_confirmed()
+
+                except Exception as e:
+                    pass
+            import time
+            time.sleep(0.01)
+
+    def start_auto_sequence_calculated(self, delay):
+        if self.is_auto_running: return
+        threading.Thread(target=self.auto_sequence_calculated_loop, args=(delay,), daemon=True).start()
+
+    def auto_sequence_calculated_loop(self, delay):
+        self.is_auto_running = True
+        print("🚀 [RPi MASTER] Bắt đầu chu trình quét 4 góc...")
+        
+        # Kịch bản xoay mâm (Trục Z) 4 góc
+        angles = [90, 180, 270, 360] 
+
+        for angle in angles:
+            self.snap_triggered.clear()
+            self.ok_received.clear()
+
+            # RPi gửi lệnh xoay mâm
+            gcode = f"G1 Z{angle}"
+            self.uart.send_gcode(gcode)
+            
+            # Chờ STM32 xoay tới nơi báo SNAP
+            self.snap_triggered.wait() 
+            print(f"📸 Đang chụp ảnh và xử lý tại góc {angle}°...")
+            
+            # --- GỌI HÀM CHỤP & PHÂN TÍCH TẠI ĐÂY ---
+            self.capture_and_analyze() 
+            time.sleep(delay) # Delay an toàn theo yêu cầu
+
+            # Chờ STM32 báo OK để sang vòng lặp tiếp theo
+            self.ok_received.wait()
+
+        # ĐÒN CHỐT HẠ: RPi TỰ RA LỆNH VỀ GỐC
+        print("⏳ Đã quét xong 4 Die. Gửi lệnh Homing và cờ LAST để kết thúc!")
+        self.snap_triggered.clear()
+        self.uart.send_gcode("G0 LAST") 
+
+    def handle_mcu_finish_confirmed(self):
+        self.is_auto_running = False
+        print("🏁 ✅ [THÀNH CÔNG]: STM32 đã hoàn tất chu trình và an tọa tại gốc!")
+        messagebox.showinfo("Auto Done", "Đã quét xong toàn bộ mâm và máy đã về gốc an toàn!")
+
+    # ========================================================================
+    # 2. HÀM XỬ LÝ ẢNH & ĐẨY LÊN GIAO DIỆN (CHẠY AN TOÀN TRÊN THREAD)
+    # ========================================================================
+    def capture_and_analyze(self):
+        """ Chụp ảnh -> Đo CD -> Tìm lỗi YOLO -> Đẩy kết quả lên UI """
+        success, frame = self.camera.capture_single(timeout_ms=1500)
+        
+        if not success or frame is None:
+            print("[AUTO] ❌ Chụp ảnh thất bại!")
+            return False
+
+        if len(frame.shape) == 2:
+            gray_img = frame.copy()
+            bgr_img = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            bgr_img = frame.copy()
+            gray_img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Chạy AI (Giả sử bác đã khai báo self.analyzer và self.detector trong __init__)
+        litho_result = getattr(self, 'analyzer', CDAnalyzer()).analyze(gray_img)
+        yolo_result = getattr(self, 'detector', ErrorDetector()).detect(gray_img)
+
+        # Đẩy dữ liệu về Thread chính của Tkinter để cập nhật UI an toàn
+        self.root.after(0, self._update_ui_with_auto_results, bgr_img, gray_img, litho_result, yolo_result)
+        return True
+
+    def _update_ui_with_auto_results(self, bgr_img, gray_img, litho_result, yolo_result):
+        """ Cập nhật giao diện nội bộ """
+        self.current_image_bgr = bgr_img
+        self.current_gray = gray_img
+        
+        self.current_measurements = litho_result.get('measurements', []) if litho_result.get('success') else []
+        self.current_error_boxes = yolo_result
+
+        # Cập nhật Bảng (Treeview)
+        for tree in [self.tree_orig, self.tree_pre, self.tree_err]:
+            tree.delete(*tree.get_children())
+
+        for i, m in enumerate(self.current_measurements, 1):
+            self.tree_orig.insert('', tk.END, values=(f"CD_{i}", m['direction'], f"{m['cd_pixel']:.2f}", f"{m['cd_um']:.3f}"))
+            self.tree_pre.insert('', tk.END, values=(f"CD_{i}", m['direction'], f"{m['cd_pixel']:.2f}", f"{m['cd_um']:.3f}"))
+
+        for i, err in enumerate(self.current_error_boxes, 1):
+            x, y, w, h, conf, cls_id = err
+            self.tree_err.insert('', tk.END, values=(f"Err_{i}", f"Defect_{cls_id}", f"{conf*100:.1f}%", f"[{x},{y},{w},{h}]"))
+
+        # Vẽ hình & Hiển thị
+        annotated_img = bgr_img.copy()
+        for (x, y, w, h, conf, cls_id) in self.current_error_boxes:
+            cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+            
+        for m in self.current_measurements:
+            pt1, pt2 = m.get('pt1'), m.get('pt2')
+            if pt1 and pt2: cv2.line(annotated_img, pt1, pt2, (0, 255, 0), 2)
+            
+        self.display_image_on_canvas(annotated_img)
+
+        # Lưu lịch sử
+        snapshot_key = datetime.datetime.now().strftime("%H:%M:%S")
+        self.history.append({'timestamp': snapshot_key, 'image_bgr': bgr_img, 'measurements': self.current_measurements, 'errors': self.current_error_boxes})
+        self.list_history.insert(tk.END, f"Auto Snap - {snapshot_key}")
+
+    def display_image_on_canvas(self, cv_img):
+        """ Hiển thị ảnh OpenCV lên Tkinter Canvas """
+        self.canvas_static.update_idletasks()
+        c_w, c_h = max(10, self.canvas_static.winfo_width()), max(10, self.canvas_static.winfo_height())
+        h, w = cv_img.shape[:2]
+        scale = min(c_w / w, c_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        img_rgb = cv2.cvtColor(cv2.resize(cv_img, (new_w, new_h)), cv2.COLOR_BGR2RGB)
+        img_tk = ImageTk.PhotoImage(Image.fromarray(img_rgb))
+        
+        self.canvas_static.delete("all")
+        self.canvas_static.image_tk = img_tk 
+        self.canvas_static.create_image((c_w - new_w) // 2, (c_h - new_h) // 2, anchor=tk.NW, image=img_tk)
+    #######################################################################################################
+    #######################################################################################################
+
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use('clam')
