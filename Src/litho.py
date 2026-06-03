@@ -63,6 +63,11 @@ def is_spotted_texture(roi_gray, roi_mask, stdev_threshold=35.0):
 # 2. MODULE CHÍNH (Đã sửa lỗi Sub-pixel Overlap và thêm fallback)
 # ==========================================
 def preprocess_image(img_orig):
+    if img_orig is None or img_orig.size == 0:
+        # Tạo ảnh đen giả để tránh lỗi (tuy nhiên nên báo lỗi từ analyze)
+        h, w = (480, 640)  # kích thước mặc định
+        return np.zeros((h, w), dtype=np.uint8), np.zeros((h, w), dtype=np.uint8)
+
     img_balanced = smart_enhance(img_orig)
     img_denoised = cv2.GaussianBlur(img_balanced, (5, 5), 0)
     _, binary_mask = cv2.threshold(img_denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -288,13 +293,29 @@ class CDAnalyzer:
         }
         Nếu không thành công: {'success': False, 'measurements': [], 'message': 'lý do'}
         """
+        if img_gray is None:
+            return {'success': False, 'measurements': [], 'message': 'Input image is None'}
+        if not isinstance(img_gray, np.ndarray):
+            return {'success': False, 'measurements': [], 'message': 'Input image is not a numpy array'}
+        if img_gray.size == 0:
+            return {'success': False, 'measurements': [], 'message': 'Input image is empty'}
+        if len(img_gray.shape) != 2:
+            return {'success': False, 'measurements': [], 'message': 'Input image is not grayscale'}
+
         # 1. Tiền xử lý
         img_balanced, mask_clean = preprocess_image(img_gray)
-
-        # 2. Tìm các bounding box hợp lệ
+        
+        # Kiểm tra ảnh có hợp lệ không (tránh trường hợp toàn đen/trắng)
+        mean_val = np.mean(img_gray)
+        if mean_val < 10:
+            return {'success': False, 'measurements': [], 'message': f'Ảnh quá tối (độ sáng TB {mean_val:.1f})'}
+        if mean_val > 245:
+            return {'success': False, 'measurements': [], 'message': f'Ảnh quá sáng (độ sáng TB {mean_val:.1f})'}
+            
+        # 2. Tìm bounding box hợp lệ (như cũ)
         boxes = find_valid_bounding_boxes(mask_clean, img_balanced, img_gray.shape)
         if not boxes:
-            return {'success': False, 'measurements': [], 'message': 'Không tìm thấy đối tượng nào'}
+            return {'success': False, 'measurements': [], 'message': 'Không tìm thấy đối tượng litho nào sau khi lọc'}
 
         # 3. Đo CD cho từng box
         results = []

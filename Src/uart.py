@@ -11,7 +11,7 @@ class UARTManager:
         self.timeout = timeout
         self.ser = None
 
-    # ------------------ Giữ nguyên các hàm cũ ------------------
+    # ------------------ Các hàm cũ ------------------
     def connect(self):
         try:
             self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
@@ -114,9 +114,9 @@ class UARTManager:
             return True, self.port
         return False, None
 
-    # ------------------ Hàm mới (chuẩn hóa và 2 giai đoạn) ------------------
+    # ------------------ Hàm mới (chuẩn hóa) ------------------
     def _read_line_normalized(self, timeout=None):
-        """Đọc một dòng, trả về string đã lowercase, bỏ \r\n\x00, hoặc None nếu timeout"""
+        """Đọc một dòng, trả về string đã lowercase, bỏ \r\n\x00, hoặc None nếu timeout."""
         if not self.is_connected():
             return None
         start = time.time()
@@ -128,16 +128,15 @@ class UARTManager:
                 try:
                     line = raw.decode('utf-8', errors='ignore').strip().lower()
                     line = line.replace('\r', '').replace('\n', '').replace('\x00', '')
+                    # In ra terminal mọi dòng nhận được (kể cả rỗng)
+                    if line:
+                        print(f"[UART_RX] {line}")
                     return line
                 except:
                     continue
             time.sleep(0.01)
 
     def _send_and_wait_for(self, cmd, expected_strings, timeout=10):
-        """
-        Gửi lệnh (nếu cmd khác rỗng) và chờ dòng có chứa bất kỳ chuỗi nào trong expected_strings.
-        Trả về (success, line).
-        """
         if not self.is_connected():
             return False, None
         if cmd:
@@ -156,10 +155,6 @@ class UARTManager:
 
     def send_command_with_confirm(self, cmd, expected_confirm="cmd received",
                                    expected_done=None, timeout=10):
-        """
-        Gửi lệnh, chờ expected_confirm, sau đó nếu expected_done được cung cấp, chờ tiếp expected_done.
-        Trả về (success, message).
-        """
         ok, line = self._send_and_wait_for(cmd, [expected_confirm], timeout)
         if not ok:
             return False, f"Không nhận được '{expected_confirm}' sau {timeout}s"
@@ -171,18 +166,12 @@ class UARTManager:
         return True, line
 
     def send_move_command(self, axis=None, position=None, is_home=False, wait_for_confirm=True, timeout=10):
-        """
-        Gửi lệnh di chuyển.
-        - is_home=True: gửi "G0", chờ "ok: homing done"
-        - is_home=False: gửi "G1 {axis}{position}" (ví dụ "G1 X10.2", "G1 Y-7"), chờ "ok: move done"
-        """
         if is_home:
             cmd = "G0"
             expected_done = "ok: homing done"
         else:
             if axis is None or position is None:
                 return False, "Missing axis or position"
-            # position có thể là số âm, đã bao gồm dấu trừ
             cmd = f"G1 {axis}{position}"
             expected_done = "ok: move done"
 
@@ -196,14 +185,24 @@ class UARTManager:
 
     def receive_state(self, timeout=None):
         """
-        Đọc UART và trả về (state, raw_line). Các state:
-        "manual", "auto1.5", "auto2", "unlock", "homing", "free", "error"
+        Đọc UART và trả về (state, raw_line).
+        Các state bao gồm:
+        - req_homing, req_rmlock, req_auto15, req_auto30 (yêu cầu từ STM32)
+        - snap, ok, finish (bắt tay auto)
+        - unlock, homing, free, error (phản hồi thường)
         """
         patterns = {
-            "manual": "manual",
-            "auto1.5": "auto1.5",
-            "auto2": "auto2",
-            "unlock": "msg: machine unlocked. proceed with caution!",
+            # Tín hiệu request từ nút bấm (STM32 gửi lên)
+            "req_homing": "req:homing",
+            "req_rmlock": "req:rmlock",
+            "req_auto15": "req:auto_1.5s",
+            "req_auto30": "req:auto_3s",
+            # Bắt tay trong chu trình auto
+            "snap": "snap",
+            "ok": "ok",
+            "finish": "finish",
+            # Phản hồi thông thường
+            "unlock": "machine unlocked",
             "homing": "ok: homing done",
             "free": ["ok: move done", "ok: arc move done"],
             "error": "error: unknown command"
