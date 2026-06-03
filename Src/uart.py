@@ -3,6 +3,7 @@ import serial
 import time
 import os
 import serial.tools.list_ports
+import threading
 
 class UARTManager:
     def __init__(self, port=None, baudrate=115200, timeout=1):
@@ -10,6 +11,8 @@ class UARTManager:
         self.baudrate = baudrate
         self.timeout = timeout
         self.ser = None
+        self.read_paused = False
+        self.read_lock = threading.Lock()
 
     # ------------------ Các hàm cũ ------------------
     def connect(self):
@@ -29,6 +32,14 @@ class UARTManager:
     def is_connected(self):
         return self.ser is not None and self.ser.is_open
 
+    def pause_reading(self):
+        with self.read_lock:
+            self.read_paused = True
+
+    def resume_reading(self):
+        with self.read_lock:
+            self.read_paused = False
+
     def send_gcode(self, gcode, wait_for_done=True, timeout=10):
         if not self.is_connected():
             return False, "Not connected"
@@ -37,15 +48,20 @@ class UARTManager:
         print(f"[UART] -> {cmd.strip()}")
         if not wait_for_done:
             return True, "ok"
-        start = time.time()
-        while time.time() - start < timeout:
-            if self.ser.in_waiting:
-                line = self.ser.readline().decode().strip().lower()
-                if "done" in line:
-                    print(f"[UART] <- {line}")
-                    return True, line
-            time.sleep(0.05)
-        return False, "Timeout waiting 'done'"
+        # Tạm dừng luồng đọc để tránh xung đột
+        self.pause_reading()
+        try:
+            start = time.time()
+            while time.time() - start < timeout:
+                if self.ser.in_waiting:
+                    line = self.ser.readline().decode().strip().lower()
+                    if "done" in line or "ok" in line:
+                        print(f"[UART] <- {line}")
+                        return True, line
+                time.sleep(0.05)
+            return False, "Timeout waiting 'done' or 'ok'"
+        finally:
+            self.resume_reading()
 
     def home(self):
         return self.send_gcode("G0")
@@ -116,9 +132,12 @@ class UARTManager:
 
     # ------------------ Hàm mới (chuẩn hóa) ------------------
     def _read_line_normalized(self, timeout=None):
-        """Đọc một dòng, trả về string đã lowercase, bỏ \r\n\x00, hoặc None nếu timeout."""
+        """Đọc một dòng, trả về string đã lowercase, bỏ \r\n\x00, hoặc None nếu timeout hoặc bị pause."""
         if not self.is_connected():
             return None
+        with self.read_lock:
+            if self.read_paused:
+                return None
         start = time.time()
         while True:
             if timeout is not None and (time.time() - start) > timeout:
@@ -128,7 +147,6 @@ class UARTManager:
                 try:
                     line = raw.decode('utf-8', errors='ignore').strip().lower()
                     line = line.replace('\r', '').replace('\n', '').replace('\x00', '')
-                    # In ra terminal mọi dòng nhận được (kể cả rỗng)
                     if line:
                         print(f"[UART_RX] {line}")
                     return line
@@ -154,54 +172,44 @@ class UARTManager:
         return False, None
 
     def send_command_with_confirm(self, cmd, expected_confirm="cmd received",
-                                   expected_done=None, timeout=10):
+                                   expected_done_patterns=None, timeout=10):
         ok, line = self._send_and_wait_for(cmd, [expected_confirm], timeout)
         if not ok:
             return False, f"Không nhận được '{expected_confirm}' sau {timeout}s"
-        if expected_done:
-            ok2, line2 = self._send_and_wait_for("", [expected_done], timeout)
+        if expected_done_patterns:
+            ok2, line2 = self._send_and_wait_for("", expected_done_patterns, timeout)
             if not ok2:
-                return False, f"Không nhận được '{expected_done}' sau {timeout}s"
+                return False, f"Không nhận được bất kỳ pattern nào trong {expected_done_patterns} sau {timeout}s"
             return True, line2
         return True, line
 
     def send_move_command(self, axis=None, position=None, is_home=False, wait_for_confirm=True, timeout=10):
         if is_home:
             cmd = "G0"
-            expected_done = "ok: homing done"
+            expected_done_patterns = ["ok: homing done", "ok", "done"]
         else:
             if axis is None or position is None:
                 return False, "Missing axis or position"
             cmd = f"G1 {axis}{position}"
-            expected_done = "ok: move done"
+            expected_done_patterns = ["ok: move done", "ok", "done"]
 
         if wait_for_confirm:
             return self.send_command_with_confirm(cmd,
                                                    expected_confirm="cmd received",
-                                                   expected_done=expected_done,
+                                                   expected_done_patterns=expected_done_patterns,
                                                    timeout=timeout)
         else:
-            return self.send_gcode(cmd, wait_for_done=False)
+            return self.send_gcode(cmd, wait_for_done=True, timeout=timeout)
 
     def receive_state(self, timeout=None):
-        """
-        Đọc UART và trả về (state, raw_line).
-        Các state bao gồm:
-        - req_homing, req_rmlock, req_auto15, req_auto30 (yêu cầu từ STM32)
-        - snap, ok, finish (bắt tay auto)
-        - unlock, homing, free, error (phản hồi thường)
-        """
         patterns = {
-            # Tín hiệu request từ nút bấm (STM32 gửi lên)
             "req_homing": "req:homing",
             "req_rmlock": "req:rmlock",
             "req_auto15": "req:auto_1.5s",
             "req_auto30": "req:auto_3s",
-            # Bắt tay trong chu trình auto
             "snap": "snap",
             "ok": "ok",
             "finish": "finish",
-            # Phản hồi thông thường
             "unlock": "machine unlocked",
             "homing": "ok: homing done",
             "free": ["ok: move done", "ok: arc move done"],

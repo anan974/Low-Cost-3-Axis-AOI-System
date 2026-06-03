@@ -272,27 +272,6 @@ class CDAnalyzer:
         self.calibration = calibration_um_per_pixel
 
     def analyze(self, img_gray):
-        """
-        Đầu vào: ảnh grayscale (numpy array, dtype=uint8)
-        Đầu ra: dict chứa kết quả đo.
-        Kết quả mẫu:
-        {
-            'success': True,
-            'measurements': [
-                {
-                    'cd_pixel': 12.34,
-                    'cd_um': 12.34 * calib,
-                    'direction': 'DỌC',
-                    'bbox': (x, y, w, h),
-                    'pt1': (x1, y1),
-                    'pt2': (x2, y2),
-                    'pixel_rough': 12
-                },
-                ...
-            ]
-        }
-        Nếu không thành công: {'success': False, 'measurements': [], 'message': 'lý do'}
-        """
         if img_gray is None:
             return {'success': False, 'measurements': [], 'message': 'Input image is None'}
         if not isinstance(img_gray, np.ndarray):
@@ -302,17 +281,27 @@ class CDAnalyzer:
         if len(img_gray.shape) != 2:
             return {'success': False, 'measurements': [], 'message': 'Input image is not grayscale'}
 
-        # 1. Tiền xử lý
-        img_balanced, mask_clean = preprocess_image(img_gray)
-        
-        # Kiểm tra ảnh có hợp lệ không (tránh trường hợp toàn đen/trắng)
+        # Kiểm tra độ sáng trung bình (nhanh)
         mean_val = np.mean(img_gray)
         if mean_val < 10:
             return {'success': False, 'measurements': [], 'message': f'Ảnh quá tối (độ sáng TB {mean_val:.1f})'}
         if mean_val > 245:
             return {'success': False, 'measurements': [], 'message': f'Ảnh quá sáng (độ sáng TB {mean_val:.1f})'}
-            
-        # 2. Tìm bounding box hợp lệ (như cũ)
+
+        # 1. Tiền xử lý
+        img_balanced, mask_clean = preprocess_image(img_gray)
+
+        # Kiểm tra tỷ lệ diện tích mask (để loại ảnh không có đối tượng)
+        h, w = img_gray.shape
+        total_pixels = h * w
+        white_pixels = np.count_nonzero(mask_clean)
+        ratio = white_pixels / total_pixels
+        if ratio < 0.01:
+            return {'success': False, 'measurements': [], 'message': f'Ảnh quá tối hoặc không có đối tượng (mask chỉ {ratio*100:.1f}%)'}
+        if ratio > 0.99:
+            return {'success': False, 'measurements': [], 'message': f'Ảnh quá sáng hoặc không có cấu trúc (mask chiếm {ratio*100:.1f}%)'}
+
+        # 2. Tìm bounding box hợp lệ
         boxes = find_valid_bounding_boxes(mask_clean, img_balanced, img_gray.shape)
         if not boxes:
             return {'success': False, 'measurements': [], 'message': 'Không tìm thấy đối tượng litho nào sau khi lọc'}
@@ -323,15 +312,11 @@ class CDAnalyzer:
             x, y, w, h = box['bbox']
             roi_gray = img_balanced[y:y+h, x:x+w]
             roi_mask = mask_clean[y:y+h, x:x+w]
-
-            # Đảm bảo hướng đã được xác định đúng (có thể box đã có sẵn)
-            # Đảm bảo hướng đã được xác định đúng (có thể box đã có sẵn)
             meas = measure_cd_line_width(roi_mask, roi_gray, box)
             if meas['is_valid']:
-                # TRẢ VỀ CHUẨN KEY CHO ui.py
                 results.append({
-                    'cd_pixel': meas['pixel_cd'],           # Giá trị pixel nguyên (int)
-                    'subpixel_cd': meas['subpixel_cd'],     # Giá trị pixel thực (float)
+                    'cd_pixel': meas['pixel_cd'],
+                    'subpixel_cd': meas['subpixel_cd'],
                     'cd_um': meas['subpixel_cd'] * self.calibration,
                     'direction': meas['direction'],
                     'bbox': (x, y, w, h),
@@ -342,9 +327,8 @@ class CDAnalyzer:
         if not results:
             return {'success': False, 'measurements': [], 'message': 'Đo thất bại (không tìm được cạnh ổn định)'}
 
-        # TRẢ VỀ THÊM CẢ ẢNH TIỀN XỬ LÝ VÀ MASK CHO ui.py (để tính diện tích)
         return {
-            'success': True, 
+            'success': True,
             'measurements': results,
             'preprocessed_img': img_balanced,
             'mask_clean': mask_clean

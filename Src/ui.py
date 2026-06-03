@@ -10,9 +10,6 @@ import serial.tools.list_ports
 import copy
 import time
 
-# =========================================
-# IMPORTS MODULES
-# =========================================
 from uart import UARTManager
 from camera import CameraManager
 from litho import CDAnalyzer
@@ -25,9 +22,6 @@ except ImportError:
         def __init__(self, path=None): pass
         def detect(self, img): return []
 
-# =========================================
-# MAIN APP CLASS
-# =========================================
 class LithoApp:
     def __init__(self, root):
         self.root = root
@@ -43,9 +37,10 @@ class LithoApp:
         self.last_snapshot_key = None
         self.axis_control_enabled = True
 
-        # Auto cycle state (điều khiển bởi STM32)
+        # Auto cycle state
         self.auto_active = False
-        self.auto_step_angle = 90          # Mỗi bước 10 độ (có thể điều chỉnh)
+        self.auto_waiting_finish = False      # Đã gửi LAST, chờ finish
+        self.auto_step_angle = 10
         self.auto_target_angle = 360
         self.current_z_angle = 0
 
@@ -186,7 +181,7 @@ class LithoApp:
         # X Axis
         x_frame = ttk.Frame(motion_frame)
         x_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(x_frame, text="X (mm):").pack(side=tk.LEFT, padx=2)
+        ttk.Label(x_frame, text="X (mm) [0-41]:").pack(side=tk.LEFT, padx=2)
         self.entry_x = ttk.Entry(x_frame, width=10)
         self.entry_x.insert(0, "0.0")
         self.entry_x.pack(side=tk.LEFT, padx=2)
@@ -196,7 +191,7 @@ class LithoApp:
         # Y Axis
         y_frame = ttk.Frame(motion_frame)
         y_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(y_frame, text="Y (mm):").pack(side=tk.LEFT, padx=2)
+        ttk.Label(y_frame, text="Y (mm) [0-41]:").pack(side=tk.LEFT, padx=2)
         self.entry_y = ttk.Entry(y_frame, width=10)
         self.entry_y.insert(0, "0.0")
         self.entry_y.pack(side=tk.LEFT, padx=2)
@@ -206,7 +201,7 @@ class LithoApp:
         # Z Axis
         z_frame = ttk.Frame(motion_frame)
         z_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(z_frame, text="Z (deg):").pack(side=tk.LEFT, padx=2)
+        ttk.Label(z_frame, text="Z (deg) [0-360]:").pack(side=tk.LEFT, padx=2)
         self.entry_z = ttk.Entry(z_frame, width=10)
         self.entry_z.insert(0, "0.0")
         self.entry_z.pack(side=tk.LEFT, padx=2)
@@ -217,7 +212,6 @@ class LithoApp:
         self.btn_home = ttk.Button(motion_frame, text="Homing", command=self.home)
         self.btn_home.pack(fill=tk.X, pady=5)
 
-        # Lưu các nút điều khiển để disable/enable theo mode
         self.control_buttons = [self.btn_move_x, self.btn_move_y, self.btn_move_z, self.btn_home]
 
         # ---------------- MAIN CONTENT ----------------
@@ -354,10 +348,6 @@ class LithoApp:
                         self.root.after(0, self._auto_snap_process)
                     elif state == "finish":
                         self.root.after(0, self._auto_cycle_finish)
-                    elif state == "req_homing":
-                        pass
-                    elif state == "req_rmlock":
-                        pass
             except AttributeError:
                 print("UART disconnected, stopping read loop.")
                 break
@@ -366,15 +356,13 @@ class LithoApp:
                 time.sleep(0.1)
 
     def _start_auto_mode(self, mode_index):
-        """Chuyển sang auto mode, gửi lệnh XY đầu tiên và chờ snap."""
         self.combo_mode.current(mode_index)
         self.on_mode_changed(send_uart=False)
         self.set_status(f"Mode set to {self.combo_mode.get()} by UART. Moving to XY...")
-        # Gửi lệnh G1 X23.5 Y19.5 (tọa độ cố định, có thể thay đổi)
         cmd_xy = "G1 X23.5 Y19.5"
         self.uart.send_gcode(cmd_xy, wait_for_done=False)
         self.auto_active = True
-        self.auto_phase = 0          # đợi snap sau XY
+        self.auto_waiting_finish = False
         self.current_z_angle = 0
 
     def toggle_camera(self):
@@ -417,12 +405,12 @@ class LithoApp:
 
     # ------------------ Auto mode logic ------------------
     def _auto_snap_process(self):
-        """Nhận 'snap' từ STM32: capture ảnh, sau đó xử lý (không gửi lệnh Z ngay)."""
-        print("[AUTO] Received 'snap', starting capture...")
         if self.current_mode == "Manual" or not self.auto_active:
             return
+        if self.auto_waiting_finish:
+            self.set_status("Auto: waiting for finish (no capture)...")
+            return
         self.set_status("Auto snap: capturing...")
-        
         def capture_and_process():
             img = None
             if self.cam.is_live:
@@ -435,19 +423,14 @@ class LithoApp:
             if img is None:
                 self.root.after(0, lambda: self.set_status("Auto snap: no image"))
                 return
-            # Chuyển xử lý về main thread để cập nhật ảnh và thực hiện measure/detect
             self.root.after(0, lambda: self._auto_process_image(img))
-        
         threading.Thread(target=capture_and_process, daemon=True).start()
 
     def _auto_process_image(self, img_bgr):
-        """Set ảnh mới và bắt đầu measure & detect (chạy trong main thread)."""
         self._set_current_image(img_bgr)
-        self._auto_measure_and_detect()   # Hàm này sẽ tạo thread riêng
+        self._auto_measure_and_detect()
 
     def _auto_measure_and_detect(self):
-        """Thực hiện measure CD và detect lỗi, sau đó tính toán và gửi lệnh Z tiếp theo."""
-        print("[AUTO] Measuring and detecting...")
         def task():
             # Measure CD
             t0 = time.time()
@@ -463,55 +446,54 @@ class LithoApp:
             t1 = time.time()
             print(f"[PERF] auto detect_errors took {t1-t0:.3f} seconds")
             self.current_error_boxes = copy.deepcopy(boxes)
-            # Cập nhật UI
+            # Update UI
             self.root.after(0, self._update_measurements_status)
             self.root.after(0, self._update_ui_after_processing)
             self.root.after(0, self._add_to_history)
             # Tính góc tiếp theo
+            if self.auto_waiting_finish:
+                return
             next_angle = self.current_z_angle + self.auto_step_angle
             if next_angle < self.auto_target_angle:
-                # Gửi lệnh di chuyển đến góc tiếp theo
                 cmd = f"G1 Z{next_angle}"
                 self.root.after(0, lambda: self.set_status(f"Auto: moving to {next_angle}°"))
                 self.uart.send_gcode(cmd, wait_for_done=False)
                 self.current_z_angle = next_angle
             elif next_angle == self.auto_target_angle:
-                # Đạt 360°, gửi lệnh LAST
                 cmd = f"G1 Z{next_angle} LAST"
-                self.root.after(0, lambda: self.set_status("Auto: final step to 360°..."))
+                self.root.after(0, lambda: self.set_status("Auto: final step to 360°, waiting for finish..."))
                 self.uart.send_gcode(cmd, wait_for_done=False)
-                self.current_z_angle = next_angle
+                self.auto_waiting_finish = True
             else:
-                # Đã qua 360° (lỗi)
                 self.root.after(0, lambda: self.set_status("Auto: unexpected angle, stopping"))
                 self.auto_active = False
         threading.Thread(target=task, daemon=True).start()
 
     def _auto_cycle_finish(self):
-        """Khi nhận 'finish', gửi G0 homing và chuyển về Manual."""
         self.set_status("Auto cycle finished. Homing...")
         self.auto_active = False
+        self.auto_waiting_finish = False
         def homing_task():
-            success, msg = self.uart.send_move_command(is_home=True, wait_for_confirm=True, timeout=40)
+            # Gửi homing, chờ ok/done với timeout 120s
+            success, msg = self.uart.send_move_command(is_home=True, wait_for_confirm=True, timeout=120)
             if success:
                 self.root.after(0, lambda: self.set_status("Homing done. Switching to Manual mode."))
-                self.root.after(0, self._switch_to_manual)
             else:
                 self.root.after(0, lambda: messagebox.showerror("Homing Error", f"Homing failed: {msg}"))
-                self.root.after(0, self._switch_to_manual)
+            self.root.after(0, self._switch_to_manual)
         threading.Thread(target=homing_task, daemon=True).start()
 
     def _switch_to_manual(self):
+        print("[DEBUG] Switching to manual")
         self.combo_mode.current(0)
         self.on_mode_changed(send_uart=False)
         self.auto_active = False
-        self.auto_phase = 0
+        self.auto_waiting_finish = False
         self.current_z_angle = 0
         self.set_status("Manual Mode selected.")
 
-    # ------------------ Các hàm điều khiển trục (tuyệt đối) ------------------
+    # ------------------ Manual Motion Control ------------------
     def move_absolute(self, axis):
-        """Gửi lệnh di chuyển tuyệt đối cho trục X, Y hoặc Z."""
         if self.current_mode != "Manual":
             messagebox.showwarning("Warning", "Axis control only available in Manual mode.")
             return
@@ -522,40 +504,39 @@ class LithoApp:
             messagebox.showinfo("Info", "Previous command still processing. Please wait.")
             return
 
-        # Lấy giá trị từ ô nhập tương ứng
         if axis == 'X':
             val_str = self.entry_x.get().strip()
+            limit = 41.0
             cmd = f"G1 X{val_str}"
         elif axis == 'Y':
             val_str = self.entry_y.get().strip()
+            limit = 41.0
             cmd = f"G1 Y{val_str}"
         elif axis == 'Z':
             val_str = self.entry_z.get().strip()
+            limit = 360.0
             cmd = f"G1 Z{val_str}"
         else:
             return
 
         try:
-            # Kiểm tra số hợp lệ
-            float(val_str)
+            val = float(val_str)
+            if val < 0 or val > limit:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Error", f"Invalid value for {axis}-axis: {val_str}")
+            messagebox.showerror("Error", f"Invalid value for {axis}-axis: {val_str}. Must be 0..{limit}.")
             return
 
-        # Disable controls trước khi gửi
         self._enable_axis_controls(False)
         self.set_status(f"Sending {cmd}...")
-
         def send_task():
-            # Dùng send_gcode với wait_for_done=True để chờ "done"
-            success, msg = self.uart.send_gcode(cmd, wait_for_done=True, timeout=40)
+            success, msg = self.uart.send_move_command(axis=axis, position=val, is_home=False, wait_for_confirm=False, timeout=50)
             if success:
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"Command {cmd} successful.\n{msg}"))
             else:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Command {cmd} failed.\n{msg}"))
             self.root.after(0, lambda: self._enable_axis_controls(True))
             self.root.after(0, lambda: self.set_status("Ready"))
-
         threading.Thread(target=send_task, daemon=True).start()
 
     def home(self):
@@ -572,7 +553,7 @@ class LithoApp:
         self._enable_axis_controls(False)
         self.set_status("Homing...")
         def homing_task():
-            success, msg = self.uart.send_move_command(is_home=True, wait_for_confirm=True, timeout=40)
+            success, msg = self.uart.send_move_command(is_home=True, wait_for_confirm=True, timeout=120)
             if success:
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"Homing successful.\n{msg}"))
             else:
@@ -596,9 +577,11 @@ class LithoApp:
         self._update_controls_by_mode()
         if self.current_mode == "Manual":
             self.auto_active = False
+            self.auto_waiting_finish = False
             self.set_status("Manual Mode selected.")
         else:
             self.auto_active = True
+            self.auto_waiting_finish = False
             self.current_z_angle = 0
             self.set_status(f"{self.current_mode} Mode selected. Waiting for STM32...")
 
@@ -904,7 +887,6 @@ class LithoApp:
         self.tree_stats.insert('', tk.END, values=("Total Litho Area (µm²)", "0.000", "0.000"))
 
     def clear_data(self):
-        # Kiểm tra cửa sổ còn tồn tại
         if not self.root.winfo_exists():
             return
         if messagebox.askyesno("Confirm", "Clear all working data?"):
