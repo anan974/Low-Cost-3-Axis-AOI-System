@@ -8,7 +8,7 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import serial.tools.list_ports
 import copy
-import time 
+import time
 
 # =========================================
 # IMPORTS MODULES
@@ -40,9 +40,18 @@ class LithoApp:
         self.focused_box_id = None
         self.focused_error_id = None
         self.current_mode = "Manual"
-        self.auto_timer_id = None
         self.last_snapshot_key = None
-        self.axis_control_enabled = True   # Để disable/enable nút axis khi đang gửi lệnh
+        self.axis_control_enabled = True
+
+        # Auto cycle state (điều khiển bởi STM32)
+        self.auto_active = False
+        self.auto_step_angle = 90          # Mỗi bước 10 độ (có thể điều chỉnh)
+        self.auto_target_angle = 360
+        self.current_z_angle = 0
+
+        # FPS counter
+        self.frame_count = 0
+        self.last_fps_time = time.time()
 
         self.photo_live = None
         self.photo_static = None
@@ -165,7 +174,7 @@ class LithoApp:
         self.btn_update_ratio.pack(side=tk.LEFT, padx=2)
 
         ttk.Label(ana_frame, text="Mode:").pack(anchor=tk.W, pady=(5,0))
-        self.combo_mode = ttk.Combobox(ana_frame, values=["Manual", "Auto 1m30s", "Auto 2m"], state="disabled")
+        self.combo_mode = ttk.Combobox(ana_frame, values=["Manual", "Auto 1m30s", "Auto 3m"], state="disabled")
         self.combo_mode.current(0)
         self.combo_mode.bind("<<ComboboxSelected>>", self.on_mode_changed)
         self.combo_mode.pack(fill=tk.X, pady=2)
@@ -341,14 +350,20 @@ class LithoApp:
             try:
                 state, line = self.uart.receive_state(timeout=0.5)
                 if state is not None:
-                    if state == "manual":
-                        self.root.after(0, lambda: self._set_mode_from_uart(0))
-                    elif state == "auto1.5":
-                        self.root.after(0, lambda: self._set_mode_from_uart(1))
-                    elif state == "auto2":
-                        self.root.after(0, lambda: self._set_mode_from_uart(2))
+                    if state == "req_auto15":
+                        self.root.after(0, lambda: self._set_mode_from_uart(1))  # Auto 1m30s
+                    elif state == "req_auto30":
+                        self.root.after(0, lambda: self._set_mode_from_uart(2))  # Auto 3m
+                    elif state == "snap" and self.current_mode != "Manual":
+                        self.root.after(0, self._auto_snap_process)
+                    elif state == "finish":
+                        self.root.after(0, self._auto_cycle_finish)
+                    elif state == "req_homing":
+                        # Có thể xử lý nếu cần
+                        pass
+                    elif state == "req_rmlock":
+                        pass
             except AttributeError:
-                # Xảy ra khi self.uart.ser bị đặt thành None (ngắt kết nối)
                 print("UART disconnected, stopping read loop.")
                 break
             except Exception as e:
@@ -359,6 +374,17 @@ class LithoApp:
         self.combo_mode.current(mode_index)
         self.on_mode_changed(send_uart=False)
         self.set_status(f"Mode set to {self.combo_mode.get()} by UART.")
+        if self.current_mode != "Manual":
+            self.auto_active = True
+            self.current_z_angle = 0
+            # Gửi lệnh đầu tiên để bắt đầu chu trình
+            first_angle = self.auto_step_angle  # mặc định 10 độ
+            cmd = f"G1 Z{first_angle}\n"
+            self.uart.send_gcode(cmd, wait_for_done=False)
+            self.set_status(f"Auto: started moving to {first_angle}°")
+        else:
+            self.auto_active = False
+            self.current_z_angle = 0
 
     def toggle_camera(self):
         if self.btn_cam_conn.cget("text") == "Connect Camera":
@@ -378,6 +404,8 @@ class LithoApp:
 
     def toggle_live(self):
         if not self.cam.is_live:
+            self.frame_count = 0
+            self.last_fps_time = time.time()
             self.cam.start_live(self._live_callback)
             self.btn_live.config(text="Live ON")
         else:
@@ -386,9 +414,92 @@ class LithoApp:
             self.canvas_live.delete("all")
 
     def _live_callback(self, frame):
+        self.frame_count += 1
+        now = time.time()
+        elapsed = now - self.last_fps_time
+        if elapsed >= 1.0:
+            fps = self.frame_count / elapsed
+            print(f"[FPS] Live camera: {fps:.2f} fps")
+            self.frame_count = 0
+            self.last_fps_time = now
         self.root.after(0, self._show_image_on_canvas, frame, self.canvas_live)
 
-    # ------------------ Các hàm điều khiển trục (sử dụng send_move_command) ------------------
+    # ------------------ Auto mode logic (điều khiển bởi STM32) ------------------
+    def _auto_snap_process(self):
+        """Nhận 'snap' từ STM32: capture ảnh, measure & detect, sau đó gửi lệnh Z tiếp theo."""
+        print("[AUTO] Received 'snap', starting capture...")
+        if self.current_mode == "Manual" or not self.auto_active:
+            return
+        self.set_status("Auto snap: capturing...")
+        # Capture ảnh (live nếu đang bật, không thì capture tĩnh)
+        def capture_and_process():
+            img = None
+            if self.cam.is_live:
+                img = self.cam.get_last_frame()
+            else:
+                success, img = self.cam.capture_single()
+                if not success:
+                    self.root.after(0, lambda: self.set_status("Auto snap: capture failed"))
+                    return
+            if img is None:
+                self.root.after(0, lambda: self.set_status("Auto snap: no image"))
+                return
+            # Cập nhật ảnh lên static view
+            self.root.after(0, lambda: self._set_current_image(img))
+            # Thực hiện measure và detect
+            self._auto_measure_and_detect()
+        threading.Thread(target=capture_and_process, daemon=True).start()
+
+    def _auto_measure_and_detect(self):
+        """Thực hiện measure CD và detect lỗi, sau đó tính toán và gửi lệnh Z tiếp theo."""
+        print("[AUTO] Measuring and detecting...")
+        def task():
+            # Measure CD
+            t0 = time.time()
+            res = self.cd_analyzer.analyze(self.current_gray)
+            t1 = time.time()
+            print(f"[PERF] auto measure_cd took {t1-t0:.3f} seconds")
+            if res.get('success'):
+                self.current_measurements = copy.deepcopy(res['measurements'])
+                self.current_preprocessed_mask = res.get('mask_clean')
+            # Detect errors
+            t0 = time.time()
+            boxes = self.err_detector.detect(self.current_gray)
+            t1 = time.time()
+            print(f"[PERF] auto detect_errors took {t1-t0:.3f} seconds")
+            self.current_error_boxes = copy.deepcopy(boxes)
+            # Cập nhật UI
+            self.root.after(0, self._update_measurements_status)
+            self.root.after(0, self._update_ui_after_processing)
+            self.root.after(0, self._add_to_history)
+            # Tính góc tiếp theo
+            next_angle = self.current_z_angle + self.auto_step_angle
+            if next_angle < self.auto_target_angle:
+                # Gửi lệnh di chuyển đến góc tiếp theo
+                cmd = f"G1 Z{next_angle}"
+                self.root.after(0, lambda: self.set_status(f"Auto: moving to {next_angle}°"))
+                self.uart.send_gcode(cmd, wait_for_done=False)
+                self.current_z_angle = next_angle
+            elif next_angle == self.auto_target_angle:
+                # Đạt 360°, gửi lệnh LAST
+                cmd = f"G1 Z{next_angle} LAST"
+                self.root.after(0, lambda: self.set_status("Auto: final step to 360°..."))
+                self.uart.send_gcode(cmd, wait_for_done=False)
+                self.current_z_angle = next_angle
+            else:
+                # Đã qua 360° (lỗi)
+                self.root.after(0, lambda: self.set_status("Auto: unexpected angle, stopping"))
+                self.auto_active = False
+        threading.Thread(target=task, daemon=True).start()
+
+    def _auto_cycle_finish(self):
+        """Khi nhận 'finish' từ STM32, kết thúc auto cycle."""
+        self.auto_active = False
+        self.set_status("Auto cycle finished. System homed.")
+        # Có thể chuyển về manual nếu muốn, nhưng không bắt buộc
+        # self.combo_mode.current(0)  # tùy chọn
+
+    # ------------------ Các hàm điều khiển trục (manual) ------------------
     def _enable_axis_controls(self, enable):
         state = tk.NORMAL if enable else tk.DISABLED
         for btn in [self.btn_up, self.btn_down, self.btn_left, self.btn_right,
@@ -415,7 +526,6 @@ class LithoApp:
             step_x = step_y = 10.0
             step_z = 1.0
 
-        # Xác định lệnh
         if direction == 'home':
             is_home = True
             axis = None
@@ -437,7 +547,6 @@ class LithoApp:
             else:
                 return
 
-        # Disable nút điều khiển
         self._enable_axis_controls(False)
         self.set_status(f"Sending {direction}...")
 
@@ -455,7 +564,7 @@ class LithoApp:
 
         threading.Thread(target=send_task, daemon=True).start()
 
-    # ------------------ Các hàm khác (giữ nguyên) ------------------
+    # ------------------ Các hàm khác (mode, image processing) ------------------
     def on_mode_changed(self, event=None, send_uart=True):
         self.current_mode = self.combo_mode.get()
         if send_uart and self.uart.is_connected():
@@ -463,18 +572,17 @@ class LithoApp:
             self.uart.send_gcode(f"M99 P{code}", wait_for_done=False)
         self._update_controls_by_mode()
         if self.current_mode == "Manual":
-            if self.auto_timer_id:
-                self.root.after_cancel(self.auto_timer_id)
-                self.auto_timer_id = None
+            self.auto_active = False
             self.set_status("Manual Mode selected.")
         else:
-            self.set_status(f"{self.current_mode} Mode selected.")
+            self.auto_active = True
+            self.current_z_angle = 0
+            self.set_status(f"{self.current_mode} Mode selected. Waiting for STM32...")
 
     def _update_controls_by_mode(self):
         state = tk.NORMAL if self.current_mode == "Manual" else tk.DISABLED
         for btn in [self.btn_measure, self.btn_detect, self.btn_upload, self.btn_capture]:
             btn.config(state=state)
-        # Axis controls được điều khiển riêng bởi _enable_axis_controls, nhưng cũng cần disable theo mode
         if self.current_mode != "Manual":
             self._enable_axis_controls(False)
         else:
@@ -507,8 +615,6 @@ class LithoApp:
     def _on_capture_success(self, img_bgr):
         self._set_current_image(img_bgr)
         self.set_status("Capture success.")
-        if self.current_mode != "Manual":
-            self.root.after(500, self._auto_sequence_measure)
 
     def _set_current_image(self, img_bgr):
         self.current_image_bgr = img_bgr.copy()
@@ -531,10 +637,15 @@ class LithoApp:
 
     def measure_cd(self):
         if self.current_gray is None:
+            messagebox.showwarning("Warning", "No image loaded!")
             return
+        gray_copy = self.current_gray.copy()
         self.set_status("Analyzing Litho...")
         def _task():
-            res = self.cd_analyzer.analyze(self.current_gray)
+            t0 = time.time()
+            res = self.cd_analyzer.analyze(gray_copy)
+            t1 = time.time()
+            print(f"[PERF] measure_cd took {t1-t0:.3f} seconds")
             self.root.after(0, self._on_measure_done, res)
         threading.Thread(target=_task, daemon=True).start()
 
@@ -548,6 +659,8 @@ class LithoApp:
             self._add_to_history()
             self.set_status("CD measurement complete.")
         else:
+            msg = res.get('message', 'Unknown error')
+            messagebox.showerror("CD measurement", msg)
             self.set_status("CD measurement failed.")
 
     def detect_errors(self):
@@ -555,7 +668,10 @@ class LithoApp:
             return
         self.set_status("Detecting defects using AI...")
         def _task():
+            t0 = time.time()
             boxes = self.err_detector.detect(self.current_gray)
+            t1 = time.time()
+            print(f"[PERF] detect_errors took {t1-t0:.3f} seconds")
             self.root.after(0, self._on_detect_done, boxes)
         threading.Thread(target=_task, daemon=True).start()
 
@@ -565,36 +681,6 @@ class LithoApp:
         self._update_ui_after_processing()
         self._add_to_history()
         self.set_status(f"Detected {len(boxes)} defect(s).")
-
-    def _auto_sequence_measure(self):
-        if self.current_mode == "Manual":
-            return
-        def _task():
-            res = self.cd_analyzer.analyze(self.current_gray)
-            self.root.after(0, self._auto_sequence_detect, res)
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _auto_sequence_detect(self, res_litho):
-        if self.current_mode == "Manual":
-            return
-        if res_litho.get('success'):
-            self.current_measurements = res_litho['measurements']
-            self.current_preprocessed_mask = res_litho.get('mask_clean')
-        def _task():
-            err = self.err_detector.detect(self.current_gray)
-            self.root.after(0, self._auto_sequence_finish, err)
-        threading.Thread(target=_task, daemon=True).start()
-
-    def _auto_sequence_finish(self, err_boxes):
-        if self.current_mode == "Manual":
-            return
-        self.current_error_boxes = err_boxes
-        self._update_measurements_status()
-        self._update_ui_after_processing()
-        self._add_to_history()
-        delay = 90000 if "1m30s" in self.current_mode else 120000
-        self.set_status(f"Auto mode: Next capture in {delay//1000}s...")
-        self.auto_timer_id = self.root.after(delay, self.capture_image)
 
     # =========================================
     # LOGIC: STATUS, IOU, DRAWING & TABLES
@@ -808,9 +894,6 @@ class LithoApp:
             self.tree_pre.delete(*self.tree_pre.get_children())
             self.tree_err.delete(*self.tree_err.get_children())
             self._reset_stats_table()
-            if self.auto_timer_id:
-                self.root.after_cancel(self.auto_timer_id)
-                self.auto_timer_id = None
             self.set_status("Data cleared.")
 
     def set_status(self, msg):
