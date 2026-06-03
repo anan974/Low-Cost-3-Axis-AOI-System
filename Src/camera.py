@@ -8,7 +8,7 @@ import numpy as np
 from ctypes import *
 
 # --- SDK IMPORT ---
-sys.path.append("./MvImport")
+sys.path.append("./Src/MvImport")
 try:
     from MvCameraControl_class import *
 except ImportError:
