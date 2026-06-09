@@ -1,3 +1,4 @@
+# ui.py
 import os
 import cv2
 import numpy as np
@@ -9,6 +10,7 @@ from PIL import Image, ImageTk
 import serial.tools.list_ports
 import copy
 import time
+from queue import Queue, Empty
 
 from uart import UARTManager
 from camera import CameraManager
@@ -25,7 +27,7 @@ except ImportError:
 class LithoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Litho & Deep Learning Inspection System")
+        self.root.title("Litho & Deep Learning Inspection System (Optimized for Pi)")
         self.root.geometry("1400x900")
 
         # State variables
@@ -39,15 +41,18 @@ class LithoApp:
 
         # Auto cycle state
         self.auto_active = False
-        self.auto_waiting_finish = False      # Đã gửi LAST, chờ finish
-        self.auto_step_angle = 10
+        self.auto_waiting_finish = False
+        self.auto_step_angle = 90
         self.auto_target_angle = 360
         self.current_z_angle = 0
 
-        # FPS counter
+        # FPS counter and live view throttle
         self.frame_count = 0
         self.last_fps_time = time.time()
+        self.last_live_update = 0
+        self.live_update_interval = 1.0 / 15  # 15 fps max
 
+        # Photo references (giữ để tránh garbage collect)
         self.photo_live = None
         self.photo_static = None
 
@@ -60,7 +65,11 @@ class LithoApp:
         self.current_preprocessed_mask = None
         self.calib_ratio = 1.0
 
-        self.uart_read_thread = None
+        # Thread-safe queues
+        self.image_queue = Queue(maxsize=2)      # cho live view
+        self.result_queue = Queue()              # cho kết quả từ thread xử lý
+
+        # Stop events
         self.stop_uart_thread = False
 
         # HW Initialization
@@ -72,6 +81,10 @@ class LithoApp:
         self.setup_ui()
         self._update_controls_by_mode()
 
+        # Start UI update loop
+        self._process_queues()
+
+    # ========== UI SETUP (giữ nguyên layout cũ) ==========
     def setup_ui(self):
         style = ttk.Style()
         style.theme_use('clam')
@@ -103,16 +116,13 @@ class LithoApp:
         self.main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         # ========== LAYOUT: SIDEBAR (LEFT) + MAIN CONTENT (RIGHT) ==========
-        # Sidebar frame
         self.sidebar = ttk.Frame(self.main_frame, width=260, relief=tk.RAISED)
         self.sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
         self.sidebar.pack_propagate(False)
 
-        # Main content frame
         self.content = ttk.Frame(self.main_frame)
         self.content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # ---------------- SIDEBAR PANELS ----------------
         # 1. Connection Panel
         conn_frame = ttk.LabelFrame(self.sidebar, text="Connection", padding=8)
         conn_frame.pack(fill=tk.X, pady=5)
@@ -174,11 +184,10 @@ class LithoApp:
         self.combo_mode.bind("<<ComboboxSelected>>", self.on_mode_changed)
         self.combo_mode.pack(fill=tk.X, pady=2)
 
-        # 4. Motion Control Panel (Absolute Position)
+        # 4. Motion Control Panel
         motion_frame = ttk.LabelFrame(self.sidebar, text="Motion Control (Absolute)", padding=8)
         motion_frame.pack(fill=tk.X, pady=5)
 
-        # X Axis
         x_frame = ttk.Frame(motion_frame)
         x_frame.pack(fill=tk.X, pady=2)
         ttk.Label(x_frame, text="X (mm) [0-41]:").pack(side=tk.LEFT, padx=2)
@@ -188,7 +197,6 @@ class LithoApp:
         self.btn_move_x = ttk.Button(x_frame, text="Move X", command=lambda: self.move_absolute('X'))
         self.btn_move_x.pack(side=tk.LEFT, padx=2)
 
-        # Y Axis
         y_frame = ttk.Frame(motion_frame)
         y_frame.pack(fill=tk.X, pady=2)
         ttk.Label(y_frame, text="Y (mm) [0-41]:").pack(side=tk.LEFT, padx=2)
@@ -198,7 +206,6 @@ class LithoApp:
         self.btn_move_y = ttk.Button(y_frame, text="Move Y", command=lambda: self.move_absolute('Y'))
         self.btn_move_y.pack(side=tk.LEFT, padx=2)
 
-        # Z Axis
         z_frame = ttk.Frame(motion_frame)
         z_frame.pack(fill=tk.X, pady=2)
         ttk.Label(z_frame, text="Z (deg) [0-360]:").pack(side=tk.LEFT, padx=2)
@@ -208,14 +215,12 @@ class LithoApp:
         self.btn_move_z = ttk.Button(z_frame, text="Move Z", command=lambda: self.move_absolute('Z'))
         self.btn_move_z.pack(side=tk.LEFT, padx=2)
 
-        # Homing button
         self.btn_home = ttk.Button(motion_frame, text="Homing", command=self.home)
         self.btn_home.pack(fill=tk.X, pady=5)
 
         self.control_buttons = [self.btn_move_x, self.btn_move_y, self.btn_move_z, self.btn_home]
 
         # ---------------- MAIN CONTENT ----------------
-        # Row 1: Two canvases (Live + Static) with fixed size 640x480
         row_canvases = ttk.Frame(self.content)
         row_canvases.pack(fill=tk.BOTH, expand=True, pady=5)
 
@@ -240,7 +245,7 @@ class LithoApp:
         self.tree_stats.pack(fill=tk.X, pady=5)
         self._reset_stats_table()
 
-        # Row 3: Notebook (Original, Processed, Defects)
+        # Row 3: Notebook
         self.notebook = ttk.Notebook(self.content)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=5)
 
@@ -286,9 +291,36 @@ class LithoApp:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         return tree
 
-    # =========================================
-    # CORE LOGIC: HARDWARE
-    # =========================================
+    # ========== QUEUE PROCESSING LOOP ==========
+    def _process_queues(self):
+        """Gọi định kỳ từ main thread để xử lý kết quả từ threads"""
+        try:
+            # Xử lý ảnh live view (giảm tần suất)
+            now = time.time()
+            if now - self.last_live_update >= self.live_update_interval:
+                try:
+                    frame = self.image_queue.get_nowait()
+                    self._show_image_on_canvas(frame, self.canvas_live)
+                    self.last_live_update = now
+                except Empty:
+                    pass
+            # Xử lý kết quả từ measure/detect/capture
+            try:
+                result = self.result_queue.get_nowait()
+                if result['type'] == 'measure':
+                    self._on_measure_done(result['data'])
+                elif result['type'] == 'detect':
+                    self._on_detect_done(result['data'])
+                elif result['type'] == 'capture':
+                    self._on_capture_success(result['data'])
+                elif result['type'] == 'auto_process':
+                    self._auto_process_result(result['data'])
+            except Empty:
+                pass
+        finally:
+            self.root.after(50, self._process_queues)  # 20Hz
+
+    # ========== HARDWARE & UI CALLBACKS ==========
     def refresh_ports(self):
         all_ports = [port.device for port in serial.tools.list_ports.comports()]
         self.combo_ports['values'] = all_ports
@@ -329,41 +361,39 @@ class LithoApp:
             if self.uart.connect():
                 self.btn_uart_conn.config(text="Disconnect UART")
                 self.stop_uart_thread = False
-                self.uart_read_thread = threading.Thread(target=self._uart_read_loop, daemon=True)
-                self.uart_read_thread.start()
                 self.set_status(f"UART Connected to {port}.")
+                self._poll_uart_state()
             else:
                 messagebox.showerror("Error", "Failed to connect UART!")
 
-    def _uart_read_loop(self):
-        while not self.stop_uart_thread and self.uart.is_connected():
-            try:
-                state, line = self.uart.receive_state(timeout=0.5)
-                if state is not None:
-                    if state == "req_auto15":
-                        self.root.after(0, lambda: self._start_auto_mode(1))
-                    elif state == "req_auto30":
-                        self.root.after(0, lambda: self._start_auto_mode(2))
-                    elif state == "snap" and self.current_mode != "Manual":
-                        self.root.after(0, self._auto_snap_process)
-                    elif state == "finish":
-                        self.root.after(0, self._auto_cycle_finish)
-            except AttributeError:
-                print("UART disconnected, stopping read loop.")
-                break
-            except Exception as e:
-                print(f"UART read error: {e}")
-                time.sleep(0.1)
+    def _poll_uart_state(self):
+        """Gọi định kỳ để lấy state từ UART (non-blocking)"""
+        if not self.uart.is_connected():
+            return
+        state, line = self.uart.receive_state(timeout=0)
+        if state is not None:
+            if state == "req_auto15":
+                self._start_auto_mode(1)
+            elif state == "req_auto30":
+                self._start_auto_mode(2)
+            elif state == "snap" and self.current_mode != "Manual":
+                self._auto_snap_process()
+            elif state == "finish":
+                self._auto_cycle_finish()
+        self.root.after(100, self._poll_uart_state)
 
     def _start_auto_mode(self, mode_index):
         self.combo_mode.current(mode_index)
         self.on_mode_changed(send_uart=False)
         self.set_status(f"Mode set to {self.combo_mode.get()} by UART. Moving to XY...")
-        cmd_xy = "G1 X23.5 Y19.5"
-        self.uart.send_gcode(cmd_xy, wait_for_done=False)
+        cmd_xy = "G1 X16"
+        threading.Thread(target=self._send_uart_command, args=(cmd_xy, False), daemon=True).start()
         self.auto_active = True
         self.auto_waiting_finish = False
         self.current_z_angle = 0
+
+    def _send_uart_command(self, cmd, wait=False):
+        self.uart.send_gcode(cmd, wait_for_done=wait)
 
     def toggle_camera(self):
         if self.btn_cam_conn.cget("text") == "Connect Camera":
@@ -395,20 +425,23 @@ class LithoApp:
     def _live_callback(self, frame):
         self.frame_count += 1
         now = time.time()
-        elapsed = now - self.last_fps_time
-        if elapsed >= 1.0:
-            fps = self.frame_count / elapsed
-            print(f"[FPS] Live camera: {fps:.2f} fps")
+        if now - self.last_fps_time >= 1.0:
+            fps = self.frame_count / (now - self.last_fps_time)
+            print(f"[FPS] Live: {fps:.2f}")
             self.frame_count = 0
             self.last_fps_time = now
-        self.root.after(0, self._show_image_on_canvas, frame, self.canvas_live)
+        # Resize trước khi đưa vào queue để giảm gánh nặng UI
+        h, w = frame.shape[:2]
+        scale = min(640/w, 480/h)
+        new_w, new_h = int(w*scale), int(h*scale)
+        frame_resized = cv2.resize(frame, (new_w, new_h))
+        try:
+            self.image_queue.put_nowait(frame_resized)
+        except:
+            pass
 
-    # ------------------ Auto mode logic ------------------
     def _auto_snap_process(self):
-        if self.current_mode == "Manual" or not self.auto_active:
-            return
-        if self.auto_waiting_finish:
-            self.set_status("Auto: waiting for finish (no capture)...")
+        if self.current_mode == "Manual" or not self.auto_active or self.auto_waiting_finish:
             return
         self.set_status("Auto snap: capturing...")
         def capture_and_process():
@@ -423,46 +456,43 @@ class LithoApp:
             if img is None:
                 self.root.after(0, lambda: self.set_status("Auto snap: no image"))
                 return
-            self.root.after(0, lambda: self._auto_process_image(img))
+            self.result_queue.put({'type': 'auto_process', 'data': img})
         threading.Thread(target=capture_and_process, daemon=True).start()
 
-    def _auto_process_image(self, img_bgr):
+    def _auto_process_result(self, img_bgr):
         self._set_current_image(img_bgr)
         self._auto_measure_and_detect()
 
     def _auto_measure_and_detect(self):
         def task():
-            # Measure CD
             t0 = time.time()
             res = self.cd_analyzer.analyze(self.current_gray)
             t1 = time.time()
-            print(f"[PERF] auto measure_cd took {t1-t0:.3f} seconds")
+            print(f"[PERF] auto measure_cd took {t1-t0:.3f} s")
             if res.get('success'):
                 self.current_measurements = copy.deepcopy(res['measurements'])
                 self.current_preprocessed_mask = res.get('mask_clean')
-            # Detect errors
             t0 = time.time()
             boxes = self.err_detector.detect(self.current_gray)
             t1 = time.time()
-            print(f"[PERF] auto detect_errors took {t1-t0:.3f} seconds")
+            print(f"[PERF] auto detect_errors took {t1-t0:.3f} s")
             self.current_error_boxes = copy.deepcopy(boxes)
-            # Update UI
             self.root.after(0, self._update_measurements_status)
             self.root.after(0, self._update_ui_after_processing)
             self.root.after(0, self._add_to_history)
-            # Tính góc tiếp theo
+
             if self.auto_waiting_finish:
                 return
             next_angle = self.current_z_angle + self.auto_step_angle
             if next_angle < self.auto_target_angle:
                 cmd = f"G1 Z{next_angle}"
                 self.root.after(0, lambda: self.set_status(f"Auto: moving to {next_angle}°"))
-                self.uart.send_gcode(cmd, wait_for_done=False)
+                threading.Thread(target=self._send_uart_command, args=(cmd, False), daemon=True).start()
                 self.current_z_angle = next_angle
             elif next_angle == self.auto_target_angle:
                 cmd = f"G1 Z{next_angle} LAST"
                 self.root.after(0, lambda: self.set_status("Auto: final step to 360°, waiting for finish..."))
-                self.uart.send_gcode(cmd, wait_for_done=False)
+                threading.Thread(target=self._send_uart_command, args=(cmd, False), daemon=True).start()
                 self.auto_waiting_finish = True
             else:
                 self.root.after(0, lambda: self.set_status("Auto: unexpected angle, stopping"))
@@ -474,7 +504,6 @@ class LithoApp:
         self.auto_active = False
         self.auto_waiting_finish = False
         def homing_task():
-            # Gửi homing, chờ ok/done với timeout 120s
             success, msg = self.uart.send_move_command(is_home=True, wait_for_confirm=True, timeout=120)
             if success:
                 self.root.after(0, lambda: self.set_status("Homing done. Switching to Manual mode."))
@@ -484,7 +513,6 @@ class LithoApp:
         threading.Thread(target=homing_task, daemon=True).start()
 
     def _switch_to_manual(self):
-        print("[DEBUG] Switching to manual")
         self.combo_mode.current(0)
         self.on_mode_changed(send_uart=False)
         self.auto_active = False
@@ -492,7 +520,6 @@ class LithoApp:
         self.current_z_angle = 0
         self.set_status("Manual Mode selected.")
 
-    # ------------------ Manual Motion Control ------------------
     def move_absolute(self, axis):
         if self.current_mode != "Manual":
             messagebox.showwarning("Warning", "Axis control only available in Manual mode.")
@@ -530,7 +557,7 @@ class LithoApp:
         self._enable_axis_controls(False)
         self.set_status(f"Sending {cmd}...")
         def send_task():
-            success, msg = self.uart.send_move_command(axis=axis, position=val, is_home=False, wait_for_confirm=False, timeout=50)
+            success, msg = self.uart.send_move_command(axis=axis, position=val, is_home=False, wait_for_confirm=True, timeout=50)
             if success:
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"Command {cmd} successful.\n{msg}"))
             else:
@@ -568,12 +595,11 @@ class LithoApp:
             btn.config(state=state)
         self.axis_control_enabled = enable
 
-    # ------------------ Các hàm khác (mode, image processing) ------------------
     def on_mode_changed(self, event=None, send_uart=True):
         self.current_mode = self.combo_mode.get()
         if send_uart and self.uart.is_connected():
             code = 0 if self.current_mode == "Manual" else (1 if "1m30s" in self.current_mode else 2)
-            self.uart.send_gcode(f"M99 P{code}", wait_for_done=False)
+            threading.Thread(target=self._send_uart_command, args=(f"M99 P{code}", False), daemon=True).start()
         self._update_controls_by_mode()
         if self.current_mode == "Manual":
             self.auto_active = False
@@ -594,9 +620,7 @@ class LithoApp:
         else:
             self._enable_axis_controls(True)
 
-    # =========================================
-    # CORE LOGIC: IMAGE & PROCESSING (giữ nguyên)
-    # =========================================
+    # ========== IMAGE & PROCESSING ==========
     def upload_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png *.bmp")])
         if path:
@@ -613,7 +637,7 @@ class LithoApp:
             else:
                 success, img = self.cam.capture_single()
             if success and img is not None:
-                self.root.after(0, self._on_capture_success, img)
+                self.result_queue.put({'type': 'capture', 'data': img})
             else:
                 self.root.after(0, lambda: messagebox.showerror("Error", "Failed to capture image!"))
         threading.Thread(target=_task, daemon=True).start()
@@ -651,8 +675,8 @@ class LithoApp:
             t0 = time.time()
             res = self.cd_analyzer.analyze(gray_copy)
             t1 = time.time()
-            print(f"[PERF] measure_cd took {t1-t0:.3f} seconds")
-            self.root.after(0, self._on_measure_done, res)
+            print(f"[PERF] measure_cd took {t1-t0:.3f} s")
+            self.result_queue.put({'type': 'measure', 'data': res})
         threading.Thread(target=_task, daemon=True).start()
 
     def _on_measure_done(self, res):
@@ -678,8 +702,8 @@ class LithoApp:
             t0 = time.time()
             boxes = self.err_detector.detect(gray_copy)
             t1 = time.time()
-            print(f"[PERF] detect_errors took {t1-t0:.3f} seconds")
-            self.root.after(0, self._on_detect_done, boxes)
+            print(f"[PERF] detect_errors took {t1-t0:.3f} s")
+            self.result_queue.put({'type': 'detect', 'data': boxes})
         threading.Thread(target=_task, daemon=True).start()
 
     def _on_detect_done(self, boxes):
@@ -689,9 +713,7 @@ class LithoApp:
         self._add_to_history()
         self.set_status(f"Detected {len(boxes)} defect(s).")
 
-    # =========================================
-    # LOGIC: STATUS, IOU, DRAWING & TABLES (giữ nguyên)
-    # =========================================
+    # ========== LOGIC: STATUS, IOU, DRAWING & TABLES ==========
     def _update_measurements_status(self):
         if self.current_image_bgr is None:
             return
@@ -821,14 +843,13 @@ class LithoApp:
         photo = ImageTk.PhotoImage(image=Image.fromarray(img_res))
         canvas.delete("all")
         canvas.create_image(max_w//2, max_h//2, anchor=tk.CENTER, image=photo)
+        # Giữ tham chiếu
         if canvas == self.canvas_live:
             self.photo_live = photo
         else:
             self.photo_static = photo
 
-    # =========================================
-    # HISTORY & UTILITIES
-    # =========================================
+    # ========== HISTORY & UTILITIES ==========
     def _add_to_history(self):
         if not self.current_measurements:
             return
@@ -856,6 +877,9 @@ class LithoApp:
             'err_c': err_c
         }
         self.history.append(snap)
+        # Giới hạn history để tránh tràn RAM (giữ 30 mục gần nhất)
+        if len(self.history) > 30:
+            self.history.pop(0)
         display_str = f"{ts} | Orig CD: {avg_o:.3f}µm | Pre CD: {avg_p:.3f}µm | Defects: {err_c}"
         self.list_history.insert(tk.END, display_str)
         self.list_history.yview(tk.END)
