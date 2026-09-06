@@ -172,7 +172,7 @@ int main(void)
 	              {
 	                  system_alarm = 0; // MỞ KHÓA MÁY!
 	                  if (is_last_cmd) {
-	                      HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
+	                      //HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
 	                      HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 40, 100);
 	                  } else {
 	                      HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 40, 100);
@@ -189,7 +189,7 @@ int main(void)
 
 	                  if (is_last_cmd) {
 	                      current_mode = MODE_NORMAL; // Khôi phục chế độ bình thường
-	                      HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
+	                      //HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100);
 	                      HAL_UART_Transmit(&huart1, (uint8_t*)"OK: Homing done\n", 16, 100);
 	                  } else {
 	                      char ack[] = "OK: Homing done\n";
@@ -235,8 +235,6 @@ int main(void)
 	                      if (is_last_cmd) {
 	                          current_mode = MODE_NORMAL; // Chạy xong hết -> nhả máy về Normal
 	                          HAL_UART_Transmit(&huart1, (uint8_t*)"FINISH\n", 7, 100); // Báo RPi hạ màn
-	                      } else {
-	                          HAL_UART_Transmit(&huart1, (uint8_t*)"OK\n", 3, 100); // Đòi góc tiếp theo
 	                      }
 	                  }
 	                  else
@@ -673,8 +671,11 @@ void Machine_Button_Scan(void) {
     if (HAL_GPIO_ReadPin(BTN_HOMING_PORT, BTN_HOMING_PIN) == GPIO_PIN_RESET) {
         HAL_Delay(20); // Chống rung
         if (HAL_GPIO_ReadPin(BTN_HOMING_PORT, BTN_HOMING_PIN) == GPIO_PIN_RESET) {
-            HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:HOMING\n", 11, 100);
+            //HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:HOMING\n", 11, 100);
+            Stepper_Homing();       // Homing XY
+            Stepper_Z_Homing_PWM(); // Homing Z
             while (HAL_GPIO_ReadPin(BTN_HOMING_PORT, BTN_HOMING_PIN) == GPIO_PIN_RESET);
+
         }
     }
 
@@ -682,7 +683,9 @@ void Machine_Button_Scan(void) {
     if (HAL_GPIO_ReadPin(BTN_RMLOCK_PORT, BTN_RMLOCK_PIN) == GPIO_PIN_RESET) {
         HAL_Delay(20);
         if (HAL_GPIO_ReadPin(BTN_RMLOCK_PORT, BTN_RMLOCK_PIN) == GPIO_PIN_RESET) {
-            HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:RMLOCK\n", 11, 100);
+            //HAL_UART_Transmit(&huart1, (uint8_t*)"REQ:RMLOCK\n", 11, 100);
+            system_alarm = 0;
+            HAL_UART_Transmit(&huart1, (uint8_t*)"Machine Unlocked. Proceed with caution!\n", 40, 100);
             while (HAL_GPIO_ReadPin(BTN_RMLOCK_PORT, BTN_RMLOCK_PIN) == GPIO_PIN_RESET);
         }
     }

@@ -6,4 +6,4 @@
 ../Core/Src/main.c:526:13:MX_GPIO_Init	1
 ../Core/Src/main.c:617:6:Machine_Wait_Until_Done	15
 ../Core/Src/main.c:669:6:Machine_Button_Scan	13
-../Core/Src/main.c:717:6:Error_Handler	1
+../Core/Src/main.c:722:6:Error_Handler	1

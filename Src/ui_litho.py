@@ -70,13 +70,7 @@ class LithoTestUI:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.txt_result.config(yscrollcommand=scroll.set)
 
-        # --- CỜ ĐỒNG BỘ AUTO (MASTER-SLAVE) ---
-        self.is_auto_running = False
-        self.snap_triggered = threading.Event()
-        self.ok_received = threading.Event()
         
-        # Khởi chạy luồng nghe tín hiệu mạch ngầm
-        threading.Thread(target=self.serial_background_listener, daemon=True).start()
         
     def load_image(self):
         path = filedialog.askopenfilename(
